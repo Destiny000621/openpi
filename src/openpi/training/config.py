@@ -968,6 +968,85 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+    #
+    # YAM bimanual fine-tuning configs (custom, added by LOBE).
+    #
+    # Maps the YAM bimanual robot's 3 cameras (head_camera, left_wrist_camera, right_wrist_camera)
+    # onto the AlohaInputs camera schema (cam_high, cam_left_wrist, cam_right_wrist). Uses
+    # adapt_to_pi=False because YAM's joint convention is NOT Trossen Aloha — passing the
+    # raw 14-dim joint+gripper state through is correct.
+    TrainConfig(
+        name="pi05_yam_place_vial",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/place_the_vial_v21",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            adapt_to_pi=False,
+            default_prompt="place the vial into the stand",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head_camera",
+                                "cam_left_wrist": "observation.images.left_wrist_camera",
+                                "cam_right_wrist": "observation.images.right_wrist_camera",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=56,  # 8 per device × 7 GPUs (avoid GPU 2 in use by another user)
+        checkpoint_base_dir="/mnt/localssd/sunlingfeng/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/sunlingfeng/openpi-assets",
+    ),
+    # v1: same as v0 but trained on the resampled, honest-fps dataset
+    # (ttotmoon/8ml_vial_place_30fps, real-30Hz from 50-58Hz source recordings).
+    TrainConfig(
+        name="pi05_yam_vial_30fps",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/8ml_vial_place_v21",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            adapt_to_pi=False,
+            default_prompt="place the vial into the stand",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head_camera",
+                                "cam_left_wrist": "observation.images.left_wrist_camera",
+                                "cam_right_wrist": "observation.images.right_wrist_camera",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=5_000,
+        batch_size=56,
+        # Default num_workers=2 starves 7-GPU training (each GPU shares ~0.3 of a
+        # video-decoding worker). 8 = one per GPU + spare. Watch RAM during run —
+        # each worker has the policy preprocessor in mem (~few hundred MB).
+        num_workers=8,
+        checkpoint_base_dir="/mnt/localssd/sunlingfeng/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/sunlingfeng/openpi-assets",
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
