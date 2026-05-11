@@ -1004,7 +1004,7 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
-        batch_size=56,  # 8 per device × 7 GPUs (avoid GPU 2 in use by another user)
+        batch_size=64,  # 8 per device × 8 GPUs
         checkpoint_base_dir="/mnt/localssd/sunlingfeng/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/sunlingfeng/openpi-assets",
     ),
