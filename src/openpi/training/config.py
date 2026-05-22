@@ -1047,6 +1047,43 @@ _CONFIGS = [
         checkpoint_base_dir="/mnt/localssd/sunlingfeng/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/sunlingfeng/openpi-assets",
     ),
+    # train90 variant: first 177 episodes only. Held-out 20 eps (177-196) are
+    # used by lobe's scripts/diagnose_policy_drift.py for true OOD comparison
+    # vs FM v2 (also trained on the same train90 split).
+    TrainConfig(
+        name="pi05_yam_vial_30fps_train90",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/8ml_vial_place_v21_train90",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            adapt_to_pi=False,
+            default_prompt="place the vial into the stand",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head_camera",
+                                "cam_left_wrist": "observation.images.left_wrist_camera",
+                                "cam_right_wrist": "observation.images.right_wrist_camera",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=5_000,
+        batch_size=64,
+        num_workers=8,
+        checkpoint_base_dir="/mnt/localssd/sunlingfeng/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/sunlingfeng/openpi-assets",
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
