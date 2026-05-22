@@ -19,11 +19,14 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import logging
 from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
-from loguru import logger
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 
 def _to_serializable(v):
