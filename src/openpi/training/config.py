@@ -1080,6 +1080,11 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=5_000,
         batch_size=64,
+        # fsdp_devices=1 (default) replicates the full pi05 model on every GPU →
+        # OOMs even at small batch sizes (pi05 is ~3B params; replicated state +
+        # activations exceed 80 GB on H100). fsdp_devices=8 shards across all
+        # 8 GPUs (~1.5 GB params/GPU). Required when training on 8×H100.
+        fsdp_devices=8,
         num_workers=8,
         checkpoint_base_dir="/mnt/localssd/sunlingfeng/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/sunlingfeng/openpi-assets",
