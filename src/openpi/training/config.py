@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.franka_policy as franka_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -352,6 +353,71 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotFrankaDataConfig(DataConfigFactory):
+    """Data config for a single-arm Franka FR3 (8-D EE-space, 2 cameras).
+
+    EE-space because the raw teleop never stamped arm joint_targets (dead
+    columns) — the arm command lives in target_pose. Uses the raw quaternion pose
+    directly (the recorded quaternions have 0 sign-flips, so no 6D needed).
+    The dataset (produced by ``scripts/convert_franka_raw_to_lerobot.py``) has:
+        observation.state          float32 (8,)   [qw,qx,qy,qz, x,y,z, gripper], absolute
+        action                     float32 (8,)   [qw,qx,qy,qz, x,y,z, gripper], absolute
+        observation.images.camera0 video          wrist camera
+        observation.images.camera1 video          side / third-person camera
+    """
+
+    # If true, convert the xyz translation to deltas w.r.t. the current state; the
+    # quaternion (dims 0-3) and gripper (dim 7) stay absolute — elementwise
+    # quaternion deltas aren't valid rotations, and absolute orientation regresses
+    # cleanly. Poses are stored absolute in the dataset, so keep this True.
+    use_delta_joint_actions: bool = True
+    # Injected into the input data when the "prompt" key is not present.
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Map the dataset's LeRobot keys onto the keys FrankaInputs expects.
+        # camera1 (side) -> base_0_rgb; camera0 (wrist) -> left_wrist_0_rgb.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.camera1",
+                        "observation/wrist_image": "observation.images.camera0",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[franka_policy.FrankaInputs(model_type=model_config.model_type)],
+            outputs=[franka_policy.FrankaOutputs()],
+        )
+
+        if self.use_delta_joint_actions:
+            # quaternion (0-3) absolute, xyz (4-6) delta vs. state, gripper (7) absolute.
+            delta_action_mask = _transforms.make_bool_mask(-4, 3, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            # Our LeRobot dataset's action column is "action" (singular); the loader
+            # reads the action-horizon sequence from this key before the repack runs.
+            action_sequence_keys=("action",),
         )
 
 
@@ -1088,6 +1154,107 @@ _CONFIGS = [
         num_workers=8,
         checkpoint_base_dir="/mnt/localssd/sunlingfeng/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/sunlingfeng/openpi-assets",
+    ),
+    # Sichang SFT: 4-vial pick-and-place, 180 episodes @ 30fps
+    # (HF: Sichang0621/vials_4_30fps_180, converted to v2.1 → local/vials_4_30fps_180_v21).
+    TrainConfig(
+        name="pi05_yam_vial_4_30fps",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/vials_4_30fps_180_v21",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            adapt_to_pi=False,
+            default_prompt="pick up all vials and place them in the stand",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head_camera",
+                                "cam_left_wrist": "observation.images.left_wrist_camera",
+                                "cam_right_wrist": "observation.images.right_wrist_camera",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=12000,
+        batch_size=64,
+        # fsdp_devices=8 shards the ~3B pi05 model across all 8 H200s; without it the
+        # full model replicates per-GPU and OOMs. Required for 8-GPU training.
+        fsdp_devices=8,
+        num_workers=8,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # Sichang 2nd SFT: vials_4 (all 180 eps) augmented with 46 selected episodes from
+    # ttotmoon/8ml_vial_place_30fps (eps 0-40, 165, 167, 168, 172, 177) → 226 eps / 236,684 frames.
+    # Built with scripts/merge_lerobot_v21.py into local/vials_4_aug_8ml46_v21.
+    # Single prompt for all data (the 8ml single-vial demos are extra data for the 4-vial task).
+    TrainConfig(
+        name="pi05_yam_vial_4_30fps_aug",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/vials_4_aug_8ml46_v21",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            adapt_to_pi=False,
+            default_prompt="pick up all vials and place them in the stand",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head_camera",
+                                "cam_left_wrist": "observation.images.left_wrist_camera",
+                                "cam_right_wrist": "observation.images.right_wrist_camera",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        batch_size=64,
+        fsdp_devices=8,
+        num_workers=8,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    #
+    # Fine-tuning single-arm Franka FR3 configs (see docs/franka_finetune.md).
+    #
+    # 8-D EE-space action/state: [qw,qx,qy,qz, x,y,z, gripper] = target_pose + gripper.
+    # EE-space because the raw teleop never stamped arm joint_targets (dead columns).
+    # Absolute poses -> DeltaActions(make_bool_mask(-4, 3, -1)): xyz delta vs. state,
+    # quaternion + gripper absolute. No AssetsConfig: norm-stats computed fresh.
+    TrainConfig(
+        name="pi05_franka_lan_insertion",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotFrankaDataConfig(
+            repo_id="local/lan_insertion_v21",
+            default_prompt="Unplug the cable from the current port, then insert it into the blue port",
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=5_000,
+        batch_size=64,
+        fsdp_devices=8,
+        num_workers=8,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
 ]
 
