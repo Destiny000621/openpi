@@ -7,15 +7,23 @@ from openpi import transforms
 from openpi.models import model as _model
 
 
+# [quat, xyz, gripper | joint_pos arm | joint_vel | wrench] — the first 8 dims
+# mirror the 8-D action layout (see scripts/convert_franka_raw_to_lerobot.py).
+FRANKA_STATE_DIM = 29
+FRANKA_ACTION_DIM = 8
+
+
 def make_franka_example() -> dict:
     """Creates a random input example for the single-arm Franka policy.
 
-    State/action are 8-D EE-space: [qw, qx, qy, qz, x, y, z, gripper]
-    (target_pose + gripper; see scripts/convert_franka_raw_to_lerobot.py). Two
-    cameras: a side (third-person) view and a wrist view.
+    State is 29-D: [qw, qx, qy, qz, x, y, z, gripper, j0..j6, j0_vel..j6_vel,
+    gripper_vel, fx, fy, fz, tx, ty, tz] (ee_pose + gripper + arm joint_pos +
+    joint_vel + wrench). Actions are 8-D EE-space: [qw, qx, qy, qz, x, y, z,
+    gripper] (target_pose + gripper; see scripts/convert_franka_raw_to_lerobot.py).
+    Two cameras: a side (third-person) view and a wrist view.
     """
     return {
-        "observation/state": np.random.rand(8),
+        "observation/state": np.random.rand(FRANKA_STATE_DIM),
         "observation/image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/wrist_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "prompt": "do something",
@@ -33,15 +41,18 @@ def _parse_image(image) -> np.ndarray:
 
 @dataclasses.dataclass(frozen=True)
 class FrankaInputs(transforms.DataTransformFn):
-    """Inputs transform for a single-arm Franka FR3 (8-D EE-space, 2 cameras).
+    """Inputs transform for a single-arm Franka FR3 (29-D state, 8-D EE actions, 2 cameras).
 
-    State/action are [qw, qx, qy, qz, x, y, z, gripper] (EE pose + gripper). The
-    two physical cameras map onto pi0.5's image slots as:
+    State is [qw, qx, qy, qz, x, y, z, gripper, j0..j6, j0_vel..j6_vel,
+    gripper_vel, fx..tz]; actions are [qw, qx, qy, qz, x, y, z, gripper]
+    (target_pose + gripper). The first 8 state dims mirror the action layout —
+    DeltaActions relies on that. The two physical cameras map onto pi0.5's
+    image slots as:
         base_0_rgb        <- side / third-person camera  (avantbot camera1)
         left_wrist_0_rgb  <- wrist camera                (avantbot camera0)
         right_wrist_0_rgb <- zeros (masked; Franka has no second wrist cam)
 
-    State/actions are passed through unchanged (8-D); the model-side
+    State/actions are passed through unchanged; the model-side
     ``PadStatesAndActions`` pads them to the model action_dim (32).
     """
 
@@ -49,11 +60,19 @@ class FrankaInputs(transforms.DataTransformFn):
     model_type: _model.ModelType
 
     def __call__(self, data: dict) -> dict:
+        state = np.asarray(data["observation/state"])
+        if state.shape[-1] != FRANKA_STATE_DIM:
+            raise ValueError(
+                f"Expected {FRANKA_STATE_DIM}-D Franka state "
+                f"[quat, xyz, gripper, joint_pos, joint_vel, wrench], got {state.shape}. "
+                "8-D states come from a pre-29-D dataset/client — re-run "
+                "scripts/convert_franka_raw_to_lerobot.py or update the client."
+            )
         base_image = _parse_image(data["observation/image"])
         wrist_image = _parse_image(data["observation/wrist_image"])
 
         inputs = {
-            "state": data["observation/state"],
+            "state": state,
             "image": {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": wrist_image,
@@ -89,4 +108,4 @@ class FrankaOutputs(transforms.DataTransformFn):
 
     def __call__(self, data: dict) -> dict:
         # Return the first 8 action dims ([quat, xyz, gripper]); the rest is padding.
-        return {"actions": np.asarray(data["actions"][:, :8])}
+        return {"actions": np.asarray(data["actions"][:, :FRANKA_ACTION_DIM])}

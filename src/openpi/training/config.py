@@ -358,13 +358,17 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotFrankaDataConfig(DataConfigFactory):
-    """Data config for a single-arm Franka FR3 (8-D EE-space, 2 cameras).
+    """Data config for a single-arm Franka FR3 (29-D state, 8-D EE actions, 2 cameras).
 
-    EE-space because the raw teleop never stamped arm joint_targets (dead
-    columns) — the arm command lives in target_pose. Uses the raw quaternion pose
-    directly (the recorded quaternions have 0 sign-flips, so no 6D needed).
-    The dataset (produced by ``scripts/convert_franka_raw_to_lerobot.py``) has:
-        observation.state          float32 (8,)   [qw,qx,qy,qz, x,y,z, gripper], absolute
+    EE-space actions because the raw teleop never stamped arm joint_targets
+    (dead columns) — the arm command lives in target_pose. Quaternions are
+    canonicalized by the converter (per-stream continuity fix + dataset-level
+    reference hemisphere; see scripts/convert_franka_raw_to_lerobot.py). The
+    state front (dims 0-7) mirrors the action layout so DeltaActions lines up;
+    the rest is extra proprio. The dataset has:
+        observation.state          float32 (29,)  [qw,qx,qy,qz, x,y,z, gripper,
+                                                   j0..j6, j0_vel..j6_vel,
+                                                   gripper_vel, fx..tz], absolute
         action                     float32 (8,)   [qw,qx,qy,qz, x,y,z, gripper], absolute
         observation.images.camera0 video          wrist camera
         observation.images.camera1 video          side / third-person camera
@@ -402,6 +406,8 @@ class LeRobotFrankaDataConfig(DataConfigFactory):
 
         if self.use_delta_joint_actions:
             # quaternion (0-3) absolute, xyz (4-6) delta vs. state, gripper (7) absolute.
+            # The 8-dim mask only touches actions[:8]/state[:8]; the extra state
+            # proprio (dims 8-28) is never delta'd.
             delta_action_mask = _transforms.make_bool_mask(-4, 3, -1)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
@@ -1236,15 +1242,17 @@ _CONFIGS = [
     #
     # Fine-tuning single-arm Franka FR3 configs (see docs/franka_finetune.md).
     #
-    # 8-D EE-space action/state: [qw,qx,qy,qz, x,y,z, gripper] = target_pose + gripper.
-    # EE-space because the raw teleop never stamped arm joint_targets (dead columns).
-    # Absolute poses -> DeltaActions(make_bool_mask(-4, 3, -1)): xyz delta vs. state,
-    # quaternion + gripper absolute. No AssetsConfig: norm-stats computed fresh.
+    # 8-D EE-space actions [qw,qx,qy,qz, x,y,z, gripper] = target_pose + gripper;
+    # 29-D state = [quat, xyz, gripper | joint_pos arm | joint_vel | wrench].
+    # EE-space actions because the raw teleop never stamped arm joint_targets
+    # (dead columns). Absolute poses -> DeltaActions(make_bool_mask(-4, 3, -1)):
+    # xyz delta vs. state, quaternion + gripper absolute. No AssetsConfig:
+    # norm-stats computed fresh.
     TrainConfig(
         name="pi05_franka_lan_insertion",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotFrankaDataConfig(
-            repo_id="local/lan_insertion_v21",
+            repo_id="local/lan_insertion_s29_v21",
             default_prompt="Unplug the cable from the current port, then insert it into the blue port",
             use_delta_joint_actions=True,
         ),

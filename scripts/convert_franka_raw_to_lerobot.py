@@ -1,21 +1,37 @@
 """Convert raw single-arm Franka FR3 recordings to an EE-space LeRobot v2.1 dataset.
 
-Why EE-space (not joint-space): in these GELLO/Haply recordings the arm columns of
-``joint_targets`` are DEAD (std=0 — never stamped by the teleop/CRISP stack); only
-the gripper column carries signal. The real arm command lives in ``target_pose``
-(absolute EE target pose, stamped by the runner in both Cartesian and joint-IK mode).
+Why EE-space actions (not joint-space): in these GELLO/Haply recordings the arm
+columns of ``joint_targets`` are DEAD (std=0 — never stamped by the teleop/CRISP
+stack); only the gripper column carries signal. The real arm command lives in
+``target_pose`` (absolute EE target pose, stamped by the runner in both Cartesian
+and joint-IK mode).
 
-Representation (8-D — target_pose + gripper, used directly):
-    state  = [ qw, qx, qy, qz, x, y, z,  gripper ]   from ee_pose + gripper state
-    action = [ qw, qx, qy, qz, x, y, z,  gripper ]   from target_pose + gripper action
+Representation:
+    action (8-D) = [ qw, qx, qy, qz, x, y, z,  gripper ]        target_pose + gripper target
+    state (29-D) = [ qw, qx, qy, qz, x, y, z,  gripper,         ee_pose + gripper (dims 0-7)
+                     j0..j6,                                    joint_pos arm columns (dims 8-14)
+                     j0_vel..j6_vel, gripper_vel,               joint_vel (dims 15-22)
+                     fx, fy, fz, tx, ty, tz ]                   wrench (dims 23-28)
 
-We keep the raw quaternion (measured: 0 sign-flips across the whole dataset, so it is
-already continuous — no need for 6D). Quaternions are canonicalized per episode to a
-single hemisphere (qw>=0 at frame 0) so the same physical orientation is represented
-consistently across episodes. xyz are world-frame meters; gripper is raw knuckle
-radians in [0, 0.7929]. Poses are stored ABSOLUTE; the TrainConfig applies
-DeltaActions(mask=(-4,3,-1)) at train time: xyz -> delta vs state, quaternion +
-gripper stay absolute.
+The first 8 state dims mirror the action layout — the train-time
+DeltaActions(mask=(-4,3,-1)) subtracts state[:8] from the action chunk, so
+[quat, xyz, gripper] MUST stay at the front of the state. The extra proprio
+(arm joint positions, joint velocities incl. gripper, external wrench) rides
+behind it; all of it is present in 77/77 recorded episodes.
+
+Quaternion canonicalization: the driver emits per-sample quats whose sign jumps
+hemisphere whenever the physical qw crosses 0 — and this task's orientation sits
+at qw~0, so the dataset has persistent within-episode sign flips, episodes split
+across both hemispheres, and state/action streams that disagree. We repair all
+three: (1) enforce sign continuity along each stream, (2) flip the action stream
+to agree with the state stream, (3) flip whole episodes to a dataset-level
+reference orientation (computed in a cheap npz-only pre-pass, saved to
+quat_reference.json for the deploy client). Do NOT canonicalize by sign(qw) —
+qw~0 makes that decision noise.
+
+xyz are world-frame meters; gripper is raw knuckle radians in [0, 0.7929].
+Poses are stored ABSOLUTE; the TrainConfig applies DeltaActions(mask=(-4,3,-1))
+at train time: xyz -> delta vs state, quaternion + gripper stay absolute.
 
 Why not avantbot's convert_lerobot + convert_v3_to_v21.py: avantbot emits LeRobot v3.0
 (flattened per-dim columns, many episodes per parquet); openpi's lerobot 0.1.0 needs
@@ -25,8 +41,11 @@ recordings and writes clean EE-space v2.1 directly.
 
 Raw layout (one dir per session, one subdir per episode):
     <session>/episode_*/
-        arm0_states.npz     # ee_pose (T,7)=[qw,qx,qy,qz,x,y,z]; gripper: gripper_pos or joint_pos[:,7]
-        arm0_actions.npz    # target_pose (T,7)=[qw,qx,qy,qz,x,y,z]; gripper: gripper_target or joint_targets[:,7]
+        arm0_states.npz     # ee_pose (T,7)=[qw,qx,qy,qz,x,y,z], joint_pos (T,8),
+                            # joint_vel (T,8), joint_eff (T,7), wrench (T,6);
+                            # gripper: gripper_pos or joint_pos[:,7]
+        arm0_actions.npz    # target_pose (T,7)=[qw,qx,qy,qz,x,y,z]; gripper:
+                            # gripper_target or joint_targets[:,7]
         camera0.mp4         # wrist camera
         camera1.mp4         # side / third-person camera
         metadata.json, SUCCESS
@@ -35,9 +54,13 @@ Usage:
     export HF_LEROBOT_HOME=/mnt/localssd/Sichang/lerobot_home
     uv run python scripts/convert_franka_raw_to_lerobot.py \
         --input-dir "/mnt/localssd/Sichang/Autel Haply Dataset" \
-        --repo-id local/lan_insertion_v21 \
+        --repo-id local/lan_insertion_s29_v21 \
         --task "insert the LAN cable" \
         --fps 30 --success-only
+
+Use a fresh repo id for the 29-D schema (the _s29 convention) — do not reuse or
+--overwrite a pre-29-D 8-D dataset name; old datasets/checkpoints are
+incompatible (FrankaInputs rejects 8-D states).
 """
 
 from __future__ import annotations
@@ -55,16 +78,60 @@ from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotData
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-STATE_NAMES = ["qw", "qx", "qy", "qz", "x", "y", "z", "gripper"]  # 8-D
+# Action layout; also the first 8 dims of the state (see module docstring).
+ACTION_NAMES = ["qw", "qx", "qy", "qz", "x", "y", "z", "gripper"]  # 8-D
+STATE_NAMES = [
+    *ACTION_NAMES,                                                  # ee_pose + gripper (0-7)
+    *[f"j{i}" for i in range(7)],                                   # joint_pos arm (8-14)
+    *[f"j{i}_vel" for i in range(7)], "gripper_vel",                # joint_vel (15-22)
+    "fx", "fy", "fz", "tx", "ty", "tz",                             # wrench (23-28)
+]  # 29-D
 
 
-def _canon_quat(pose7: np.ndarray) -> np.ndarray:
-    """Copy of [qw,qx,qy,qz,x,y,z] with the quaternion flipped to the qw>=0
-    hemisphere (per-episode constant sign; preserves within-episode continuity)."""
-    pose = pose7.copy()
-    if pose[0, 0] < 0:  # decide hemisphere from the first frame
-        pose[:, :4] *= -1.0
-    return pose
+def _continuity_fix(quat: np.ndarray) -> np.ndarray:
+    """Remove recorded hemisphere jumps: flip the sign from each frame where the
+    stream's consecutive 4-D dot goes negative (a >90-deg jump in quat space is a
+    sign flip, not physical motion at 30 fps)."""
+    dots = np.einsum("td,td->t", quat[1:], quat[:-1])
+    flips = np.cumprod(np.where(dots < 0, -1.0, 1.0))
+    out = quat.copy()
+    out[1:] *= flips[:, None]
+    return out
+
+
+def _compute_quat_reference(episodes: list[Path]) -> np.ndarray:
+    """Dataset-level reference orientation (unit quat) from an npz-only pre-pass.
+
+    Per episode: continuity-fix ee_pose quats and take their normalized mean.
+    Episode means are hemisphere-aligned to the first episode before averaging,
+    so the reference is well-defined even though raw episodes sit in both
+    hemispheres. Whole episodes are later flipped to agree with this reference.
+    """
+    means = []
+    for ep in episodes:
+        q = _continuity_fix(np.load(ep / "arm0_states.npz")["ee_pose"].astype(np.float64)[:, :4])
+        m = q.mean(axis=0)
+        means.append(m / np.linalg.norm(m))
+    ref = means[0]
+    acc = np.zeros(4)
+    for m in means:
+        acc += m if np.dot(m, ref) >= 0 else -m
+    return acc / np.linalg.norm(acc)
+
+
+def _canonicalize_quats(
+    state_quat: np.ndarray, action_quat: np.ndarray, quat_ref: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Continuity-fix both streams, make the action stream agree with the state
+    stream, then flip the whole episode onto the reference hemisphere. Returns
+    the canonicalized (state_quat, action_quat)."""
+    sq = _continuity_fix(state_quat)
+    aq = _continuity_fix(action_quat)
+    if np.dot(aq[0], sq[0]) < 0:  # target leads measured pose by mm — same hemisphere
+        aq = -aq
+    if np.dot(sq.mean(axis=0), quat_ref) < 0:
+        sq, aq = -sq, -aq
+    return sq, aq
 
 
 def _gripper(store, prefer_key: str, joint_key: str) -> np.ndarray:
@@ -114,7 +181,7 @@ def _read_video(path: Path, max_side: int = 640) -> np.ndarray:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input-dir", type=Path, required=True, help="Dataset root (contains session dirs).")
-    ap.add_argument("--repo-id", type=str, required=True, help="e.g. local/lan_insertion_v21")
+    ap.add_argument("--repo-id", type=str, required=True, help="e.g. local/lan_insertion_s29_v21")
     ap.add_argument("--task", type=str, default=None, help="Instruction; defaults to metadata task_instruction.")
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--success-only", action="store_true", help="Only convert episodes with a SUCCESS marker.")
@@ -129,13 +196,16 @@ def main() -> None:
 
     episodes = _find_episodes(args.input_dir, args.success_only)
 
+    quat_ref = _compute_quat_reference(episodes)
+    logger.info("Quaternion reference (canonical hemisphere): %s", np.round(quat_ref, 4).tolist())
+
     probe = _read_video(episodes[0] / "camera0.mp4")[0]
     height, width = int(probe.shape[0]), int(probe.shape[1])
     logger.info("Camera resolution: %dx%d", height, width)
 
     features = {
-        "observation.state": {"dtype": "float32", "shape": (8,), "names": STATE_NAMES},
-        "action": {"dtype": "float32", "shape": (8,), "names": STATE_NAMES},
+        "observation.state": {"dtype": "float32", "shape": (29,), "names": STATE_NAMES},
+        "action": {"dtype": "float32", "shape": (8,), "names": ACTION_NAMES},
         "observation.images.camera0": {  # wrist
             "dtype": "video",
             "shape": (height, width, 3),
@@ -165,13 +235,25 @@ def main() -> None:
 
         st = np.load(ep / "arm0_states.npz")
         ac = np.load(ep / "arm0_actions.npz")
-        # State: ee_pose (canonicalized) + gripper state.
+        ee_pose = st["ee_pose"].astype(np.float32)
+        target_pose = ac["target_pose"].astype(np.float32)
+        # One canonicalization decision per episode, shared by state and action.
+        state_quat, action_quat = _canonicalize_quats(ee_pose[:, :4], target_pose[:, :4], quat_ref)
+        # State (29-D): [quat, xyz, gripper | joint_pos arm | joint_vel | wrench].
         state = np.concatenate(
-            [_canon_quat(st["ee_pose"].astype(np.float32)), _gripper(st, "gripper_pos", "joint_pos")], axis=1
+            [
+                state_quat.astype(np.float32),
+                ee_pose[:, 4:7],
+                _gripper(st, "gripper_pos", "joint_pos"),
+                st["joint_pos"].astype(np.float32)[:, :7],
+                st["joint_vel"].astype(np.float32),
+                st["wrench"].astype(np.float32),
+            ],
+            axis=1,
         )
-        # Action: target_pose (canonicalized) + gripper action.
+        # Action (8-D): target_pose (canonicalized) + gripper action.
         action = np.concatenate(
-            [_canon_quat(ac["target_pose"].astype(np.float32)), _gripper(ac, "gripper_target", "joint_targets")],
+            [action_quat.astype(np.float32), target_pose[:, 4:7], _gripper(ac, "gripper_target", "joint_targets")],
             axis=1,
         )
         cam0 = _read_video(ep / "camera0.mp4")  # wrist
@@ -198,6 +280,9 @@ def main() -> None:
         total_frames += t
         logger.info("[%d/%d] %s -> %d frames (task=%r)", ep_idx + 1, len(episodes), ep.name, t, task)
 
+    # The deploy client needs the same hemisphere convention for its live ee_pose
+    # quats: flip the observed quat if dot(q, quat_reference) < 0.
+    (out_root / "quat_reference.json").write_text(json.dumps({"quat_reference_wxyz": quat_ref.tolist()}, indent=2))
     logger.info("Done. %d episodes / %d frames at %s", len(episodes), total_frames, out_root)
 
 
