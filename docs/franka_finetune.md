@@ -161,8 +161,8 @@ Key choices:
 ## 3. Compute norm-stats
 
 ```bash
-XLA_PYTHON_CLIENT_PREALLOCATE=false \
-  uv run python scripts/compute_norm_stats.py pi05_franka_lan_insertion
+CUDA_VISIBLE_DEVICES=0,1,2,3 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+  uv run python scripts/compute_norm_stats.py --config-name pi05_franka_lan_insertion
 ```
 
 Streams the dataset through repack → `FrankaInputs` → `DeltaActions(-4,3,-1)` and
@@ -181,6 +181,23 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false \
 ```
 
 Checkpoints land at `<checkpoint_base_dir>/pi05_franka_lan_insertion/v1/<step>/`.
+
+## Push checkpoints to huggingface
+
+```bash
+uv run python scripts/push_to_hub.py \
+  --checkpoint=/mnt/localssd/Sichang/openpi-checkpoints/pi05_franka_lan_insertion/v1/4999 \
+  --repo=Sichang0621/Franka-cable-pi05-v2-5k
+```
+
+```bash
+uv run --with "huggingface_hub[hf_transfer]" --with hf_transfer \
+  env HF_HUB_ENABLE_HF_TRANSFER=1 \
+  huggingface-cli download \
+    Sichang0621/Franka-cable-pi05-v2-5k \
+    --local-dir ~/.cache/openpi/hf/Franka-cable-pi05-v2-5k \
+    --exclude "train_state/*"
+```
 
 ## 5. Serve
 
