@@ -128,6 +128,8 @@ We will fine-tune the $\pi_{0.5}$ model on the [LIBERO dataset](https://libero-p
 2. Defining training configs and running training
 3. Spinning up a policy server and running inference
 
+For the dual-Franka UMI cardboard-box workflow—including recommended one-box logical episodes, optional original long-episode ablations, relative/absolute TCP actions, H200 training, and remote deployment—see the [dedicated guide](docs/umi_dual_franka_cardboard_box.md).
+
 ### 1. Convert your data to a LeRobot dataset
 
 We provide a minimal example script for converting LIBERO data to a LeRobot dataset in [`examples/libero/convert_libero_data_to_lerobot.py`](examples/libero/convert_libero_data_to_lerobot.py). You can easily modify it to convert your own data! You can download the raw LIBERO dataset from [here](https://huggingface.co/datasets/openvla/modified_libero_rlds), and run the script with:

@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "source_repo_id": "byang11259/cardboard_box_tcp_curated",
+  "segments": [
+    {
+      "source_episode": 0,
+      "box_index": 0,
+      "start_frame": 120,
+      "end_frame": 2540,
+      "split": "train",
+      "task": "Assemble the cardboard box and put it into the bin"
+    },
+    {
+      "source_episode": 0,
+      "box_index": 1,
+      "start_frame": 2710,
+      "end_frame": 5160,
+      "split": "train",
+      "task": "Assemble the cardboard box and put it into the bin"
+    },
+    {
+      "source_episode": 1,
+      "box_index": 0,
+      "start_frame": 90,
+      "end_frame": 2480,
+      "split": "validation",
+      "task": "Assemble the cardboard box and put it into the bin"
+    }
+  ]
+}
