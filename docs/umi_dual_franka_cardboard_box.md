@@ -25,8 +25,19 @@ representation and a controlled absolute-action baseline.
 | --- | --- | --- | --- |
 | Logical box (recommended) | relative primary | `pi05_umi_dual_franka_cardboard_box_relative` | `local/cardboard_box_tcp_curated_logical_train` |
 | Logical box (recommended) | absolute baseline | `pi05_umi_dual_franka_cardboard_box_absolute` | `local/cardboard_box_tcp_curated_logical_train` |
-| Original source episode (ablation) | relative primary | `pi05_umi_dual_franka_cardboard_box_relative_long_episode` | `byang11259/cardboard_box_tcp_curated` |
-| Original source episode (ablation) | absolute baseline | `pi05_umi_dual_franka_cardboard_box_absolute_long_episode` | `byang11259/cardboard_box_tcp_curated` |
+| Original source episode (ablation) | relative primary | `pi05_umi_dual_franka_cardboard_box_relative_long_episode` | `local/cardboard_box_tcp_curated_x264` |
+| Original source episode (ablation) | absolute baseline | `pi05_umi_dual_franka_cardboard_box_absolute_long_episode` | `local/cardboard_box_tcp_curated_x264` |
+
+> [!NOTE]
+> The long-episode configs point at `local/cardboard_box_tcp_curated_x264`, a
+> local derived copy of the curated source dataset whose parquet/meta files are
+> byte-identical and whose 36 videos are re-encoded near-losslessly
+> (libx264, `-crf 14 -g 15 -bf 0`). The original HEVC exports use ~250-frame
+> GOPs with B-frames; lerobot's torchcodec decode path
+> (`seek_mode="approximate"`) returns wrong frames near GOP tails on such
+> streams and fails its 1e-4 s timestamp-tolerance check. Dense keyframes and
+> no B-frames make index-to-pts mapping exact and random access fast. See
+> `REENCODE_PROVENANCE.md` inside the derived dataset directory.
 
 All four configs:
 
@@ -614,7 +625,7 @@ source "$HOME/.local/bin/env"
 
 git clone --recurse-submodules https://github.com/Destiny000621/openpi.git
 cd openpi
-git checkout codex/umi-dual-franka-fold-box
+git checkout umi-dual-franka
 git submodule update --init --recursive
 
 GIT_LFS_SKIP_SMUDGE=1 uv sync

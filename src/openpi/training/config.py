@@ -1323,6 +1323,9 @@ _CONFIGS = [
         batch_size=32,
         fsdp_devices=1,
         num_workers=8,
+        save_interval=5_000,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
     TrainConfig(
         name="pi05_umi_dual_franka_cardboard_box_absolute",
@@ -1337,12 +1340,15 @@ _CONFIGS = [
         batch_size=32,
         fsdp_devices=1,
         num_workers=8,
+        save_interval=5_000,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
     TrainConfig(
         name="pi05_umi_dual_franka_cardboard_box_relative_long_episode",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
         data=LeRobotUmiDualFrankaDataConfig(
-            repo_id="byang11259/cardboard_box_tcp_curated",
+            repo_id="local/cardboard_box_tcp_curated_x264",
             default_prompt="Assemble the cardboard box and put it into the bin",
             action_representation="relative",
         ),
@@ -1351,12 +1357,15 @@ _CONFIGS = [
         batch_size=32,
         fsdp_devices=1,
         num_workers=8,
+        save_interval=5_000,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
     TrainConfig(
         name="pi05_umi_dual_franka_cardboard_box_absolute_long_episode",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
         data=LeRobotUmiDualFrankaDataConfig(
-            repo_id="byang11259/cardboard_box_tcp_curated",
+            repo_id="local/cardboard_box_tcp_curated_x264",
             default_prompt="Assemble the cardboard box and put it into the bin",
             action_representation="absolute",
         ),
@@ -1365,6 +1374,9 @@ _CONFIGS = [
         batch_size=32,
         fsdp_devices=1,
         num_workers=8,
+        save_interval=5_000,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
     #
     # Fine-tuning single-arm Franka FR3 configs (see docs/franka_finetune.md).

@@ -7,7 +7,7 @@ from openpi.training import data_loader as _data_loader
 import openpi.transforms as transforms
 
 _LOGICAL_REPO_ID = "local/cardboard_box_tcp_curated_logical_train"
-_LONG_REPO_ID = "byang11259/cardboard_box_tcp_curated"
+_LONG_REPO_ID = "local/cardboard_box_tcp_curated_x264"
 _PROMPT = "Assemble the cardboard box and put it into the bin"
 
 
@@ -80,8 +80,8 @@ def test_umi_dual_franka_config_contract(
     assert train_config.fsdp_devices == 1
     assert train_config.num_workers == 8
     assert train_config.num_train_steps == 5_000
-    assert train_config.assets_base_dir == "./assets"
-    assert train_config.checkpoint_base_dir == "./checkpoints"
+    assert train_config.assets_base_dir == "/mnt/localssd/Sichang/openpi-assets"
+    assert train_config.checkpoint_base_dir == "/mnt/localssd/Sichang/openpi-checkpoints"
 
     data_config = train_config.data.create(tmp_path, train_config.model)
     assert data_config.repo_id == repo_id
