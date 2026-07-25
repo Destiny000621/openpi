@@ -55,10 +55,25 @@ class WebsocketPolicyServer:
         while True:
             try:
                 start_time = time.monotonic()
-                obs = msgpack_numpy.unpackb(await websocket.recv())
+                message = msgpack_numpy.unpackb(await websocket.recv())
+
+                # DSRL envelope: {"method": "infer"|"get_prefix_rep", "obs": {...}} with an
+                # optional "noise" key inside obs (the flow-matching latent the SAC steers).
+                # Plain-obs clients (limb OpenPIClient, older openpi_client) send the obs
+                # dict directly — no "method"/"obs" keys — and pass through unchanged.
+                method = message.get("method", "infer") if isinstance(message, dict) else "infer"
+                obs = message.get("obs", message) if isinstance(message, dict) else message
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                if method == "infer":
+                    noise = obs.pop("noise", None) if isinstance(obs, dict) else None
+                    # Only pass the kwarg when present so wrappers without a noise
+                    # parameter (e.g. PolicyRecorder) keep working on the plain path.
+                    action = self._policy.infer(obs, noise=noise) if noise is not None else self._policy.infer(obs)
+                elif method == "get_prefix_rep":
+                    action = self._policy.get_prefix_rep(obs)
+                else:
+                    raise ValueError(f"Unknown method: {method!r} (expected 'infer' or 'get_prefix_rep')")
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {

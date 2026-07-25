@@ -2,6 +2,7 @@ import logging
 import time
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 from typing_extensions import override
 import websockets.sync.client
 
@@ -44,12 +45,27 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 time.sleep(5)
 
     @override
-    def infer(self, obs: Dict) -> Dict:  # noqa: UP006
-        data = self._packer.pack(obs)
+    def infer(self, obs: Dict, noise: Optional[np.ndarray] = None) -> Dict:  # noqa: UP006
+        # DSRL: an explicit flow-matching latent replaces the server's RNG draw.
+        # Without noise the plain-obs wire format is kept byte-compatible with
+        # servers that predate the {"method", "obs"} envelope.
+        if noise is not None:
+            data = self._packer.pack({"method": "infer", "obs": {**obs, "noise": np.asarray(noise)}})
+        else:
+            data = self._packer.pack(obs)
         self._ws.send(data)
         response = self._ws.recv()
         if isinstance(response, str):
             # we're expecting bytes; if the server sends a string, it's an error.
+            raise RuntimeError(f"Error in inference server:\n{response}")
+        return msgpack_numpy.unpackb(response)
+
+    def get_prefix_rep(self, obs: Dict) -> Dict:  # noqa: UP006
+        """DSRL: pooled image-token embedding from the server ({"prefix_rep": [1, emb]})."""
+        data = self._packer.pack({"method": "get_prefix_rep", "obs": obs})
+        self._ws.send(data)
+        response = self._ws.recv()
+        if isinstance(response, str):
             raise RuntimeError(f"Error in inference server:\n{response}")
         return msgpack_numpy.unpackb(response)
 

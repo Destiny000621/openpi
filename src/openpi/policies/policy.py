@@ -119,6 +119,31 @@ class Policy(BasePolicy):
         }
         return outputs
 
+    def get_prefix_rep(self, obs: dict) -> dict:
+        """DSRL server method: pooled image-token embedding (z_rl) for the SAC state.
+
+        Returns {"prefix_rep": float32 [1, emb]} — the masked mean-pooled image-token
+        embedding from extract_image_embedding, NOT the fork's raw [b, s, emb] hidden
+        state + kv_cache (which shipped megabytes over the wire only to be discarded,
+        and read a possibly-padded token slot at position -1). Works regardless of the
+        SUBRL_RETURN_EMBED serve flag; the jitted extractor is created lazily so plain
+        serving pays nothing.
+        """
+        if self._is_pytorch_model:
+            raise NotImplementedError("get_prefix_rep is only implemented for JAX models")
+        if not hasattr(self._model, "extract_image_embedding"):
+            raise NotImplementedError("model has no extract_image_embedding — serve a pi0/pi0.5 checkpoint")
+        if not hasattr(self, "_extract_embed"):
+            self._extract_embed = nnx_utils.module_jit(self._model.extract_image_embedding)
+
+        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._input_transform(inputs)
+        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+        observation = _model.Observation.from_dict(inputs)
+        # rng is unused on the train=False path of extract_prefix_embeddings; passed for signature parity.
+        emb = np.asarray(self._extract_embed(self._rng, observation), np.float32)
+        return {"prefix_rep": emb}
+
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
@@ -136,8 +161,8 @@ class PolicyRecorder(_base_policy.BasePolicy):
         self._record_step = 0
 
     @override
-    def infer(self, obs: dict) -> dict:  # type: ignore[misc]
-        results = self._policy.infer(obs)
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        results = self._policy.infer(obs, noise=noise) if noise is not None else self._policy.infer(obs)
 
         data = {"inputs": obs, "outputs": results}
         data = flax.traverse_util.flatten_dict(data, sep="/")
@@ -147,3 +172,6 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         np.save(output_path, np.asarray(data))
         return results
+
+    def get_prefix_rep(self, obs: dict) -> dict:
+        return self._policy.get_prefix_rep(obs)
