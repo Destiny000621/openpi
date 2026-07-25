@@ -156,6 +156,10 @@ uv run python scripts/serve_policy.py --port=8111 policy:checkpoint \
   --policy.config=pi05_yam_vial_30fps \
   --policy.dir=ttotmoon/yam-vial-place-pi05-v1
 
+uv run python scripts/serve_policy.py --port=8111 policy:checkpoint \
+    --policy.config=pi05_yam_vial_30fps \
+    --policy.dir=$HOME/checkpoints/yam-vial-place-pi05-v1
+
 # from local dir
 uv run python scripts/serve_policy.py --port=8111 policy:checkpoint \
   --policy.config=pi05_yam_vial_30fps \

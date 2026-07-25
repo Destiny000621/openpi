@@ -237,6 +237,10 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # use standard Aloha data should set this to true.
     adapt_to_pi: bool = True
 
+    # Number of real robot action/state dims (14 = bimanual: 6 joints + 1 gripper per arm,
+    # 7 = single arm). Drives the delta-action mask and the output action slice.
+    action_dim: int = 14
+
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -258,10 +262,15 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
             inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
-            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
+            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi, action_dim=self.action_dim)],
         )
         if self.use_delta_joint_actions:
-            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            # One (6 joints delta, 1 gripper absolute) block per arm: (6, -1) for single arm,
+            # (6, -1, 6, -1) for bimanual.
+            mask_dims: list[int] = []
+            for _ in range(self.action_dim // 7):
+                mask_dims += [6, -1]
+            delta_action_mask = _transforms.make_bool_mask(*mask_dims)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -1047,6 +1056,83 @@ _CONFIGS = [
         checkpoint_base_dir="/mnt/localssd/sunlingfeng/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/sunlingfeng/openpi-assets",
     ),
+    # SubRL serving-only twin of pi05_yam_vial_4_30fps_aug for the NON-augmented
+    # checkpoint (Sichang0621/yam-vial-4-pi05-v1). At serve time only the model class +
+    # transforms matter (norm stats load from the checkpoint's own assets/), and those
+    # are identical to the aug config; repo_id is unused when serving.
+    TrainConfig(
+        name="pi05_yam_vial_4_30fps",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/vials_4_8ml46_v21",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            adapt_to_pi=False,
+            default_prompt="pick up all vials and place them in the stand",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head_camera",
+                                "cam_left_wrist": "observation.images.left_wrist_camera",
+                                "cam_right_wrist": "observation.images.right_wrist_camera",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        batch_size=64,
+        fsdp_devices=8,
+        num_workers=8,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # SubRL: the pi0.5-SFT config the yam-vial-aug-pi05-v1-10k checkpoint was trained
+    # with (user-provided). Registered here so `serve_policy policy:checkpoint
+    # --policy.config pi05_yam_vial_4_30fps_aug` resolves the transforms/norm-stats.
+    TrainConfig(
+        name="pi05_yam_vial_4_30fps_aug",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/vials_4_aug_8ml46_v21",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            adapt_to_pi=False,
+            default_prompt="pick up all vials and place them in the stand",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head_camera",
+                                "cam_left_wrist": "observation.images.left_wrist_camera",
+                                "cam_right_wrist": "observation.images.right_wrist_camera",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        batch_size=64,
+        fsdp_devices=8,
+        num_workers=8,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
     # train90 variant: first 177 episodes only. Held-out 20 eps (177-196) are
     # used by lobe's scripts/diagnose_policy_drift.py for true OOD comparison
     # vs FM v2 (also trained on the same train90 split).
@@ -1088,6 +1174,51 @@ _CONFIGS = [
         num_workers=8,
         checkpoint_base_dir="/mnt/localssd/sunlingfeng/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/sunlingfeng/openpi-assets",
+    ),
+    # Single-arm (left-arm-only) YAM fine-tuning. Data collected with
+    # configs/yam_gello_network_left_arm.yaml (bimanual: false) is 7-D:
+    # 6 left-arm joints + 1 gripper, with only head_camera + left_wrist_camera.
+    #
+    # Differences vs the bimanual configs above:
+    #   - action_dim=7        → delta mask becomes (6, -1) and outputs slice to 7 dims
+    #   - assets=AssetsConfig() → loads FRESH 7-D norm stats computed by
+    #     scripts/compute_norm_stats.py (NOT the base model's 14-D trossen stats)
+    #   - repack drops cam_right_wrist (not recorded); AlohaInputs fills it with a
+    #     black image + image_mask=False automatically.
+    TrainConfig(
+        name="pi05_yam_single_arm",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            # v2.1 dataset produced by scripts/convert_v3_to_v21.py, visible to lerobot as
+            # ~/.cache/huggingface/lerobot/local/yam_vital_left_v21 (see docs/yam_single_arm_finetune.md).
+            repo_id="local/yam_vital_left_v21",
+            action_dim=7,
+            assets=AssetsConfig(),
+            adapt_to_pi=False,
+            default_prompt="Grasp the vial, and insert it into the stand.",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head_camera",
+                                "cam_left_wrist": "observation.images.left_wrist_camera",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=5_000,
+        # TODO: tune to the training rig (8 per GPU). pi05 is ~3B params; on a multi-GPU
+        # box set fsdp_devices=<num_gpus> to shard the model and avoid OOM.
+        batch_size=32,
+        num_workers=8,
+        # checkpoint_base_dir / assets_base_dir default to ./checkpoints and ./assets.
+        # Override to point at the training rig's fast scratch disk if needed.
     ),
 ]
 

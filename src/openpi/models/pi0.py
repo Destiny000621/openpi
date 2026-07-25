@@ -136,6 +136,39 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
 
+    def extract_prefix_embeddings(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, *,
+        train: bool = False, image_only: bool = False,
+    ):
+        """SubRL/RLT: post-transformer prefix (image) embeddings — the RL-state (z_rl)
+        source. Prefix-only PaliGemma forward; returns (embeddings [b, s, emb],
+        mask [b, s]). image_only drops the language tokens. Ported from the sim
+        checkout (~/Desktop/research/openpi); enabled at serve time via
+        SUBRL_RETURN_EMBED=1 (see policies/policy.py)."""
+        observation = _model.preprocess_observation(rng if train else None, observation, train=train)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        num_language_tokens = (
+            observation.tokenized_prompt.shape[1] if observation.tokenized_prompt is not None else 0
+        )
+        num_image_tokens = prefix_tokens.shape[1] - num_language_tokens
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), _ = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        if image_only:
+            prefix_out = prefix_out[:, :num_image_tokens]
+            prefix_mask = prefix_mask[:, :num_image_tokens]
+        return prefix_out, prefix_mask
+
+    def extract_image_embedding(self, rng: at.KeyArrayLike, observation: _model.Observation):
+        """Jit-friendly z_rl: masked MEAN-POOLED image-token embeddings, [b, emb].
+        No python-bool kwargs and pooling inside jit, so `nnx_utils.module_jit` compiles
+        it once (~like sample_actions) instead of the eager per-call forward that made
+        the serve pause on every replan (2026-07-06 on-robot finding)."""
+        embs, mask = self.extract_prefix_embeddings(rng, observation, image_only=True)
+        m = mask.astype(embs.dtype)[..., None]
+        pooled = (embs * m).sum(axis=1) / jnp.maximum(m.sum(axis=1), 1.0)
+        return pooled.astype(jnp.float32)
+
     @at.typecheck
     def embed_suffix(
         self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]

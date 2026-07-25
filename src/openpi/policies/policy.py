@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 import logging
+import os
 import pathlib
 import time
 from typing import Any, TypeAlias
@@ -62,6 +63,16 @@ class Policy(BasePolicy):
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            # SubRL: also return pi0.5's pooled image embedding (RLT z_rl) from infer()
+            # so the online-RL critic/actor can condition on what the VLA sees. Off by
+            # default; enable with SUBRL_RETURN_EMBED=1 at serve time.
+            self._return_embed = (
+                os.environ.get("SUBRL_RETURN_EMBED") == "1" and hasattr(model, "extract_image_embedding")
+            )
+            if self._return_embed:
+                # JIT the embedding extraction like sample_actions — the eager version
+                # ran a full un-jitted prefix forward per infer and stalled the robot.
+                self._extract_embed = nnx_utils.module_jit(model.extract_image_embedding)
             self._rng = rng or jax.random.key(0)
 
     @override
@@ -100,6 +111,9 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
+        if not self._is_pytorch_model and getattr(self, "_return_embed", False):
+            # jitted pooled image-token embedding -> [emb] (RLT z_rl); first call compiles
+            outputs["image_embedding"] = np.asarray(self._extract_embed(self._rng, observation)[0], np.float32)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

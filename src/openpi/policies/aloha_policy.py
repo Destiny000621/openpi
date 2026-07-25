@@ -95,9 +95,13 @@ class AlohaOutputs(transforms.DataTransformFn):
     # the space used by the pi internal runtime which was used to train the base model.
     adapt_to_pi: bool = True
 
+    # Number of real robot action dims to return (14 = bimanual, 7 = single arm). The rest of the
+    # model's padded action dims are dropped.
+    action_dim: int = 14
+
     def __call__(self, data: dict) -> dict:
-        # Only return the first 14 dims.
-        actions = np.asarray(data["actions"][:, :14])
+        # Only return the real (non-padding) action dims.
+        actions = np.asarray(data["actions"][:, : self.action_dim])
         return {"actions": _encode_actions(actions, adapt_to_pi=self.adapt_to_pi)}
 
 
