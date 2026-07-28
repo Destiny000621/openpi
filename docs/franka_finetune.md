@@ -119,8 +119,9 @@ quat_reference.json                       canonical hemisphere for deploy
 ```
 
 The repo id is deliberately new (`_s29`): the 29-D state schema is incompatible
-with the old 8-D datasets/checkpoints, and `FrankaInputs` rejects 8-D states
-loudly.
+with the old 8-D datasets/checkpoints. `FrankaInputs` accepts the full 29-D
+state (sliced to its `state_dim`) or exactly `state_dim` dims (lean inference
+clients); anything else is rejected loudly.
 
 ## 2. `TrainConfig` (already added)
 
@@ -158,11 +159,45 @@ Key choices:
 4. **Camera mapping.** The repack maps `camera1` (side) → `base_0_rgb` and
    `camera0` (wrist) → `left_wrist_0_rgb`; `right_wrist_0_rgb` is zeroed + masked.
 
+### 8-D-state ablation: `pi05_franka_lan_insertion_s8`
+
+Identical to the config above except `state_dim=8`: the model sees only dims
+0-7 of the same s29 dataset — `[qw,qx,qy,qz, x,y,z, gripper]` (ee_pose +
+gripper), no joint_pos/joint_vel/wrench proprio. Same episodes, same actions,
+same transforms, so a head-to-head run isolates the value of the extra proprio.
+No reconversion needed; `FrankaInputs` slices the state on the fly. Norm-stats
+are per-config, so the 8-D stats live under
+`<assets_base_dir>/pi05_franka_lan_insertion_s8/` (state stats verified to match
+dims 0-7 of the 29-D config's stats exactly).
+
+At serve time an s8 checkpoint accepts either the full 29-D state (sliced
+server-side) or exactly 8 dims — a lean client can send just
+`[quat, xyz, gripper]`.
+
+### Wrist-only + 8-D-state ablation: `pi05_franka_lan_insertion_s8_wrist`
+
+`wrist_camera_only=True` + `state_dim=8`: the model sees only the wrist camera
+(the side camera / `base_0_rgb` is zeroed and masked off, the standard
+missing-camera pattern) and only the lean `[quat, xyz, gripper]` state. Same
+s29 dataset, no reconversion. 4k steps; checkpoints land at 2000 and 3999
+(final) via `save_interval=2_000` + `keep_period=2_000`.
+
+Norm-stats are image-independent (state/actions only), so this config's stats
+are byte-identical to `_s8`'s — copied rather than recomputed, at
+`<assets_base_dir>/pi05_franka_lan_insertion_s8_wrist/`.
+
+At serve time, a client may omit `observation/image` entirely and send just the
+wrist image + 8-D state.
+
 ## 3. Compute norm-stats
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 XLA_PYTHON_CLIENT_PREALLOCATE=false \
   uv run python scripts/compute_norm_stats.py --config-name pi05_franka_lan_insertion
+
+# 8-D-state ablation (same dataset, sliced state)
+CUDA_VISIBLE_DEVICES=0,1,2,3 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+  uv run python scripts/compute_norm_stats.py --config-name pi05_franka_lan_insertion_s8
 ```
 
 Streams the dataset through repack → `FrankaInputs` → `DeltaActions(-4,3,-1)` and

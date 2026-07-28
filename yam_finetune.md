@@ -12,8 +12,9 @@ trained checkpoint, which lives on HF (or GCS for cold storage).
 
 | File | What it does |
 |---|---|
-| `src/openpi/training/config.py` | Two new `TrainConfig`s: `pi05_yam_place_vial` (v0), `pi05_yam_vial_30fps` (v1) |
+| `src/openpi/training/config.py` | YAM `TrainConfig`s: `pi05_yam_place_vial` (v0), `pi05_yam_vial_30fps` (v1), plus ABC-130k configs `pi05_yam_abc_earbuds`, `pi05_yam_abc_fold_box` |
 | `scripts/convert_v3_to_v21.py` | Convert a LeRobot v3.0 dataset to v2.1 layout (openpi's lerobot 0.1.0 only reads v2.1) |
+| `scripts/convert_abc_mcap_to_lerobot_v21.py` | Convert ABC-130k MCAP episodes → LeRobot v2.1 (see [Fine-tuning from ABC-130k](#fine-tuning-from-abc-130k-mcap--v21)) |
 | `scripts/push_to_hub.py` | Push a trained checkpoint dir to HF Hub |
 | `docs/yam_finetune.md` | This doc |
 
@@ -181,6 +182,156 @@ gsutil -m cp -r \
   gs://<bucket>/<user>/checkpoints/
 ```
 
+## Fine-tuning from ABC-130k (MCAP → v2.1)
+
+[XDOF/ABC-130k](https://huggingface.co/datasets/XDOF/ABC-130k) is a large
+open bimanual-YAM teleoperation dataset. It is **not** LeRobot — episodes ship
+as **MCAP** files (`episode.mcap` + optional `annotation.mcap`), one directory
+per episode under `data/{train,val}/<task_name>/episode_<uuid>/`. The robot,
+14-D joint/gripper convention, and camera set are the **same YAM platform** this
+doc already targets, so once converted to v2.1 an ABC task drops straight into
+steps 1–5 above with the same `LeRobotAlohaDataConfig` recipe
+(`adapt_to_pi=False`, `asset_id="trossen"`).
+
+`scripts/convert_abc_mcap_to_lerobot_v21.py` does the MCAP→v2.1 conversion. Two
+worked examples are already in `config.py`: `pi05_yam_abc_earbuds`
+(`insert the wireless bluetooth earbuds into the charging case`) and
+`pi05_yam_abc_fold_box` (`fold the paper box`), each trained on the first 500
+episodes of its task.
+
+### A0. Access + deps
+
+ABC-130k is **gated** — request access on the dataset page and `hf auth login`
+first. The converter shells out to **ffmpeg/ffprobe** (decode the per-frame
+Annex-B video, letterbox, re-encode), so make sure they're on `PATH`
+(`sudo apt-get install -y ffmpeg`).
+
+### A1. Download N episodes of one task
+
+Episodes are ~180 MB (RealSense) to ~600 MB (ZED-X) each — 500 episodes is
+~140–435 GB, so pick N deliberately. **List explicitly, then fetch per file** —
+do *not* rely on `snapshot_download(allow_patterns=["data/train/<task>/**"])`:
+the `**` glob silently matched **0 files** under `huggingface_hub` 1.23.0 (works
+on 0.32.x), so it can "succeed" while downloading nothing.
+
+```python
+# download_task.py  —  uv run --with huggingface_hub python download_task.py
+import concurrent.futures as cf
+from huggingface_hub import list_repo_files, hf_hub_download
+
+REPO, TASK, N = "XDOF/ABC-130k", "fold_the_paper_box", 500
+OUT = "/mnt/localssd/Sichang/abc_fold_box/raw"
+
+files = sorted(
+    f for f in list_repo_files(REPO, repo_type="dataset")
+    if f.startswith(f"data/train/{TASK}/") and f.endswith("/episode.mcap")
+)[:N]                                      # sorted by uuid → deterministic subset
+print(f"{len(files)} episodes")            # assert files, else you got the glob bug
+
+def get(p):
+    return hf_hub_download(REPO, repo_type="dataset", filename=p, local_dir=OUT)
+
+with cf.ThreadPoolExecutor(max_workers=12) as ex:
+    list(ex.map(get, files))
+```
+
+`list_repo_files` enumerates the whole 170k-file repo (~1–2 min) before the
+first byte downloads — that pause is normal, not a hang. To also pull subtask
+labels for later use, drop the `episode.mcap` filter (grabs `annotation.mcap`
+too; ~42k of ABC's episodes are annotated). For the **val split** used in A4,
+repeat with `data/val/<task>/`.
+
+### A2. Convert MCAP → LeRobot v2.1
+
+```bash
+cd /mnt/localssd/Sichang/openpi
+uv run --python 3.11 \
+  --with numpy --with mcap --with mcap-protobuf-support --with pyarrow --with tyro \
+  python scripts/convert_abc_mcap_to_lerobot_v21.py \
+    --root /mnt/localssd/Sichang/abc_fold_box/raw/data/train/fold_the_paper_box \
+    --out  /mnt/localssd/Sichang/lerobot_home/local/abc_fold_box_v21 \
+    --workers 48 \
+    --max-episodes 500          # optional cap; omit to convert everything under --root
+```
+
+What it produces (byte-identical layout to `vials_4_30fps_180_v21`):
+
+- `observation.state` / `action`: **14-D float32**
+  `[left j0..5, left grip, right j0..5, right grip]`, joints in **radians**,
+  gripper normalized **0=closed … 1=open**. `action` = commanded joints
+  (`/{side}-arm-action` + `/{side}-ee-action`), `state` = measured. Absolute,
+  not delta (pi0.5 applies `DeltaActions` internally — see Gotcha #4).
+- Three cameras letterboxed to **640×480 h264**: `head_camera`,
+  `left_wrist_camera`, `right_wrist_camera`.
+- `meta/{info.json,episodes.jsonl,episodes_stats.jsonl,tasks.jsonl,stats.json}`
+  plus `meta/episode_ids.json` mapping each `episode_index` → original ABC uuid.
+- `default_prompt` for your TrainConfig = the string the converter reads from
+  each episode's `/instruction` topic and writes into `tasks.jsonl`.
+
+**Fixed 30 Hz resampling (the important part).** In ABC every stream runs on its
+own clock: the action stream at **~200 Hz**, state at **~265 Hz**, and cameras at
+**30 Hz (ZED-X) or 50–60 Hz (RealSense)**. The converter builds a fixed 30 Hz
+tick clock over the overlap window of all streams and does **causal floor
+matching** (latest message at or before each tick) — actions are subsampled
+~6.7:1, faster cameras are decimated, and no camera is below 30 Hz so frames are
+never duplicated. This 30 Hz target matches the vial datasets and the official
+ABC exporter, and is what keeps you clear of the FPS-mislabel trap in Gotcha #5.
+Both station types are handled automatically: RealSense (mono top camera) and
+ZED-X (stereo top — one eye picked deterministically per episode).
+
+The conversion is CPU-bound (ffmpeg); 500 episodes ≈ 45–60 min on 48 workers.
+Sanity-check that it loads through openpi's pinned lerobot:
+
+```python
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+ds = LeRobotDataset("local/abc_fold_box_v21")     # HF_LEROBOT_HOME must be set
+print(ds.num_episodes, ds.num_frames, ds.fps)     # 500, ~2.26M, 30
+```
+
+### A3. TrainConfig → norm-stats → train
+
+Add a `TrainConfig` exactly like step 1 (copy `pi05_yam_abc_fold_box`), pointing
+`repo_id` at your converted dataset and `default_prompt` at the task string.
+Then run steps 2–3 unchanged:
+
+```bash
+export HF_LEROBOT_HOME=/mnt/localssd/Sichang/lerobot_home
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}/mnt/localssd/Sichang/miniconda3/envs/openpi/lib"
+
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+  uv run python scripts/compute_norm_stats.py --config-name pi05_yam_abc_fold_box --max-frames 600000
+
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+  uv run python scripts/train.py pi05_yam_abc_fold_box --exp-name=v1 --no-resume
+```
+
+pi0.5 transfers fast but bigger single-task sets keep improving past 5k: our 500-
+episode runs were still dropping held-out error at 15k steps (earbuds final train
+loss ~0.011, fold-box ~0.019). Checkpoints land at 5000 / 10000 / 14999.
+
+### A4. Pick a checkpoint on the held-out val split
+
+Unlike the vial data (all in-train), ABC ships a real `data/val/<task>/` split.
+Convert those episodes too (A1+A2 with `data/val/…`, output `<task>_val_v21`)
+and rank checkpoints by open-loop action MSE on data the model never saw:
+
+```bash
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+  uv run python scripts/eval_open_loop.py \
+    --config-name pi05_yam_abc_fold_box \
+    --repo-id local/abc_fold_box_val_v21 --episodes 0-29 \
+    --stride 90 --max-per-ep 40 \
+    --checkpoint <ckpt_dir>/5000 \
+    --checkpoint <ckpt_dir>/10000 \
+    --checkpoint <ckpt_dir>/14999
+```
+
+It reports overall / joints / gripper MSE (lower = better). For both example
+tasks 14999 won cleanly, but treat this as a *proxy* to choose 1–2 checkpoints
+for real robot demos: open-loop MSE penalizes valid alternative strategies on
+multimodal tasks, and the gripper column matters most for grasp-timing tasks
+(e.g. insertion) where MSE is least trustworthy.
+
 ## Serving
 
 ```bash
@@ -279,8 +430,9 @@ These have cost real time:
 
 ## What's different from upstream openpi
 
-- Two `TrainConfig` entries in `src/openpi/training/config.py`
-- One dataset-converter script (`scripts/convert_v3_to_v21.py`)
+- YAM + ABC-130k `TrainConfig` entries in `src/openpi/training/config.py`
+- Two dataset-converter scripts (`scripts/convert_v3_to_v21.py`,
+  `scripts/convert_abc_mcap_to_lerobot_v21.py`)
 - One HF-push script (`scripts/push_to_hub.py`)
 - This doc
 

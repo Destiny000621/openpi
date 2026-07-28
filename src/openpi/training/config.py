@@ -382,6 +382,14 @@ class LeRobotFrankaDataConfig(DataConfigFactory):
     use_delta_joint_actions: bool = True
     # Injected into the input data when the "prompt" key is not present.
     default_prompt: str | None = None
+    # State prefix width fed to the model: 29 (full proprio, default) or 8
+    # (ee_pose + gripper only; dims 0-7 of the same dataset — controlled ablation
+    # of the extra proprio without reconverting).
+    state_dim: int = franka_policy.FRANKA_STATE_DIM
+    # If true, train on the wrist camera only: the side camera (base_0_rgb) is
+    # zeroed + masked off; the wrist stays in left_wrist_0_rgb. Same dataset,
+    # no reconversion — controlled ablation of the third-person view.
+    wrist_camera_only: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -401,7 +409,13 @@ class LeRobotFrankaDataConfig(DataConfigFactory):
         )
 
         data_transforms = _transforms.Group(
-            inputs=[franka_policy.FrankaInputs(model_type=model_config.model_type)],
+            inputs=[
+                franka_policy.FrankaInputs(
+                    model_type=model_config.model_type,
+                    state_dim=self.state_dim,
+                    wrist_camera_only=self.wrist_camera_only,
+                )
+            ],
             outputs=[franka_policy.FrankaOutputs()],
         )
 
@@ -1301,6 +1315,88 @@ _CONFIGS = [
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
     #
+    # ABC-130k (XDOF) single-task YAM configs. MCAP episodes converted to v2.1 by
+    # scripts/convert_abc_mcap_to_lerobot_v21.py (yam_finetune.md §"Fine-tuning
+    # from ABC-130k"). Same YAM platform as the vial configs — 14-D joints+grippers,
+    # adapt_to_pi=False, trossen assets — 500 train episodes per task, 30 Hz.
+    # Checkpoints at 5k/10k/14999 (save_interval=5k); val-split selection via
+    # scripts/eval_open_loop.py picked 14999 for both tasks.
+    #
+    TrainConfig(
+        name="pi05_yam_abc_earbuds",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/abc_earbuds_v21",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            adapt_to_pi=False,
+            default_prompt="insert the wireless bluetooth earbuds into the charging case",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head_camera",
+                                "cam_left_wrist": "observation.images.left_wrist_camera",
+                                "cam_right_wrist": "observation.images.right_wrist_camera",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        batch_size=64,
+        fsdp_devices=8,
+        num_workers=8,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    TrainConfig(
+        name="pi05_yam_abc_fold_box",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/abc_fold_box_v21",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            adapt_to_pi=False,
+            default_prompt="fold the paper box",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head_camera",
+                                "cam_left_wrist": "observation.images.left_wrist_camera",
+                                "cam_right_wrist": "observation.images.right_wrist_camera",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        batch_size=64,
+        fsdp_devices=8,
+        num_workers=8,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    #
     # Dual-arm Franka UMI cardboard-box configs.
     #
     # Source: byang11259/cardboard_box_tcp_curated. The default pair uses a
@@ -1398,6 +1494,54 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=5_000,
         batch_size=64,
+        fsdp_devices=8,
+        num_workers=8,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # s8 ablation: identical to pi05_franka_lan_insertion except the state fed to
+    # the model is only dims 0-7 of the same s29 dataset — [qw,qx,qy,qz, x,y,z,
+    # gripper] (ee_pose + gripper), no joint_pos/joint_vel/wrench proprio.
+    # Same episodes, same actions, same transforms; only the state input differs,
+    # so a head-to-head run isolates the value of the extra proprio. Norm-stats
+    # are per-config (keyed by config name), so the 8-D stats live separately.
+    TrainConfig(
+        name="pi05_franka_lan_insertion_s8",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotFrankaDataConfig(
+            repo_id="local/lan_insertion_s29_v21",
+            default_prompt="Unplug the cable from the current port, then insert it into the blue port",
+            use_delta_joint_actions=True,
+            state_dim=8,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=7_000,
+        batch_size=128,
+        fsdp_devices=8,
+        num_workers=8,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # Wrist-only + 8-D-state ablation: the model sees only the wrist camera
+    # (side camera / base_0_rgb zeroed + masked off) and only state dims 0-7
+    # ([quat, xyz, gripper] — same lean state as _s8). Same s29 dataset, no
+    # reconversion. 4k steps; checkpoints land at 2000 and 3999 (final) —
+    # save_interval=2k, keep_period=2k so the 2k checkpoint survives pruning.
+    TrainConfig(
+        name="pi05_franka_lan_insertion_s8_wrist",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotFrankaDataConfig(
+            repo_id="local/lan_insertion_s29_v21",
+            default_prompt="Unplug the cable from the current port, then insert it into the blue port",
+            use_delta_joint_actions=True,
+            state_dim=8,
+            wrist_camera_only=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=4_000,
+        save_interval=2_000,
+        keep_period=2_000,
+        batch_size=128,
         fsdp_devices=8,
         num_workers=8,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
