@@ -27,6 +27,7 @@ representation and a controlled absolute-action baseline.
 | Logical box (recommended) | absolute baseline | `pi05_umi_dual_franka_cardboard_box_absolute` | `local/cardboard_box_tcp_curated_logical_train` |
 | Original source episode (ablation) | relative primary | `pi05_umi_dual_franka_cardboard_box_relative_long_episode` | `local/cardboard_box_tcp_curated_x264` |
 | Original source episode (ablation) | absolute baseline | `pi05_umi_dual_franka_cardboard_box_absolute_long_episode` | `local/cardboard_box_tcp_curated_x264` |
+| Original source episode (ablation) | gripper-only-state relative | `pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode` | `local/cardboard_box_tcp_curated_x264` |
 
 > [!NOTE]
 > The long-episode configs point at `local/cardboard_box_tcp_curated_x264`, a
@@ -39,26 +40,32 @@ representation and a controlled absolute-action baseline.
 > no B-frames make index-to-pts mapping exact and random access fast. See
 > `REENCODE_PROVENANCE.md` inside the derived dataset directory.
 
-All four configs:
+All five configs:
 
 - start from `gs://openpi-assets/checkpoints/pi05_base/params`;
-- use the same two cameras, state representation, 6D rotation encoding,
-  prompt plumbing, horizon, and training hyperparameters;
+- use the same two cameras, 6D rotation encoding, prompt plumbing, horizon,
+  and training hyperparameters;
 - consume the canonical post-repack keys `observation/state`,
   `observation/left_head`, `observation/right_head`, `actions`, and `prompt`;
 - use an action horizon of 50 at the dataset's nominal 29.97 Hz, about
   1.67 seconds of predicted motion; and
 - require their **own fresh normalization statistics**.
 
-For either episode path, the relative and absolute configs use identical
-absolute state20. The relative action is fixed-query-anchor true-SE(3)
-action20; the baseline action is absolute action20. The logical and long paths
-must not share norm stats or checkpoints even when their representation is the
-same.
+For either episode path, the full-state relative and absolute configs use
+identical absolute state20. The relative action is fixed-query-anchor
+true-SE(3) action20; the baseline action is absolute action20. The
+gripper-only variant keeps the relative action20 but reduces the policy state
+to the 2-D absolute gripper vector (see
+[Gripper-only-state cross-embodiment variant](#gripper-only-state-cross-embodiment-variant)).
+The logical and long paths must not share norm stats or checkpoints even when
+their representation is the same.
 
-The portable defaults target one H200: full fine-tuning, batch size 32,
-`fsdp_devices=1`, eight data workers, 5,000 steps, `./assets`, and
-`./checkpoints`.
+The four full-state configs register portable one-H200 defaults: full
+fine-tuning, batch size 32, `fsdp_devices=1`, eight data workers, and 5,000
+steps. The gripper-only config registers an 8-GPU recipe instead: batch size
+128, `fsdp_devices=8`, 10,000 steps. On this machine all five configs use
+`/mnt/localssd/Sichang/openpi-assets` and
+`/mnt/localssd/Sichang/openpi-checkpoints`.
 
 During training, the adapter maps each LeRobot row's `task` string to the model
 `prompt`, so a reviewed logical-episode manifest can supply a fold-only label.
@@ -499,6 +506,40 @@ pair or the long pair, it uses the same state, rotation representation,
 cameras, prompt, episode construction, horizon, and hyperparameters as the
 relative primary so that pairwise comparison isolates action relativity.
 
+### Gripper-only-state cross-embodiment variant
+
+`pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode` keeps
+the fixed-anchor relative action20 exactly as the primary relative config but
+replaces the 20-D absolute state with the 2-D absolute gripper vector:
+
+```text
+[left_current_gripper, right_current_gripper]
+```
+
+Rationale: with a single observation timestep, pose-relative proprioception is
+identically zero, so the absolute pose is the only pose signal — and it is
+scene/marker-specific. Dropping it forces vision-based control in the spirit
+of the original UMI recipe and keeps the policy embodiment-agnostic. The
+gripper values stay absolute in `[0, 1]` with `1 = open` and are already
+embodiment-normalized.
+
+Differences from the other configs:
+
+- The policy never receives or emits absolute pose; inter-arm geometry must
+  be inferred from the two fisheye views alone. The full-state relative and
+  absolute configs remain available as controlled comparisons.
+- Its `state` norm stats are 2-D; the relative-action stats follow the same
+  distribution as the primary relative config. `state_mode="gripper_only"`
+  requires `action_representation="relative"`; combining it with the absolute
+  baseline is rejected.
+- **The WebSocket response is a relative chunk, not absolute targets**: per
+  arm `[rel_xyz(3), rel_quat_xyzw(4), gripper_abs(1)]`, all 50 waypoints
+  expressed in that arm's query-time TCP frame. The robot client must compose
+  `T_world_tcp_pred[k] = T_world_tcp_query[r] @ T_rel_pred[r, k]` with its own
+  saved per-arm anchors. The same fixed-anchor rules apply: never compose
+  waypoint `k` against the pose reached at waypoint `k - 1`, and never refresh
+  the anchor during open-loop prefix execution.
+
 ### Rotation and internal padding
 
 The implemented 6D convention is the first two **rows** of the rotation matrix,
@@ -508,10 +549,12 @@ preprocessing and online serving; do not mix it with a column-based decoder or
 transpose the decoded matrix. Tests must cover identity, random rotations,
 near-degenerate 6D vectors, and quaternion sign equivalence (`q` and `-q`).
 
-The physical state and action dimensions are 20. π0.5 zero-pads them to its
-native 32-dimensional model tensors internally and slices predictions back to
-20 before the robot-specific output transform. The last 12 values have no
-robot meaning and must never reach a controller or enter 20D norm stats.
+The physical action dimension is always 20, and the full-state configs use a
+20-D state (the gripper-only variant's state is 2-D). π0.5 zero-pads state and
+actions to its native 32-dimensional model tensors internally and slices
+predictions back to 20 before the robot-specific output transform. The padded
+values have no robot meaning and must never reach a controller or enter the
+physical norm stats.
 
 ## Cameras and visual preprocessing
 
@@ -565,10 +608,12 @@ Franka joints
   -> FK in each robot base
   -> fixed flange-to-chopstick-tip transform
   -> calibrated common marker/world TCP poses
-  -> absolute state20
+  -> absolute state20 (gripper-only config: 2-D gripper state)
   -> π0.5 action20
-  -> (relative config only) policy output transform composes the saved
-     query-time TCP anchors
+  -> (full-state relative config) policy output transform composes the saved
+     query-time TCP anchors server-side
+  -> (gripper-only config) the server returns the relative chunk and the
+     robot client composes its own saved query-time TCP anchors
   -> absolute world TCP targets
   -> transform into each Franka base
   -> convert TCP target to flange target if required by the controller
@@ -714,24 +759,33 @@ JAX_PLATFORMS=cpu CUDA_VISIBLE_DEVICES='' \
   --num-samples 32
 ```
 
-Original long-source relative and absolute:
+Original long-source relative, absolute, and gripper-only:
 
 ```bash
 JAX_PLATFORMS=cpu CUDA_VISIBLE_DEVICES='' \
   uv run python scripts/inspect_umi_dual_franka_dataset.py \
   --config-name pi05_umi_dual_franka_cardboard_box_relative_long_episode \
-  --repo-id byang11259/cardboard_box_tcp_curated \
+  --repo-id local/cardboard_box_tcp_curated_x264 \
   --num-samples 32
 
 JAX_PLATFORMS=cpu CUDA_VISIBLE_DEVICES='' \
   uv run python scripts/inspect_umi_dual_franka_dataset.py \
   --config-name pi05_umi_dual_franka_cardboard_box_absolute_long_episode \
-  --repo-id byang11259/cardboard_box_tcp_curated \
+  --repo-id local/cardboard_box_tcp_curated_x264 \
+  --num-samples 32
+
+JAX_PLATFORMS=cpu CUDA_VISIBLE_DEVICES='' \
+  uv run python scripts/inspect_umi_dual_franka_dataset.py \
+  --config-name pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode \
+  --repo-id local/cardboard_box_tcp_curated_x264 \
   --num-samples 32
 ```
 
 The inspector verifies raw16 shapes, `action[t] = state[t + 1]`, transformed
-state20/action20 shapes, image masks, and raw16 round trips. On the long repo,
+state/action shapes (state20 for full-state configs, 2-D gripper state for the
+gripper-only config, action20 for all), image masks, and raw16 round trips —
+for the gripper-only config it emulates the documented client-side anchor
+composition before checking the round trip. On the long repo,
 its reported episode count means **source** episodes. It samples chunks that
 fit within those source bounds; it does not infer or mask physical-box
 boundaries. Review known boundary-adjacent chunks separately.
@@ -797,20 +851,27 @@ uv run scripts/compute_norm_stats.py \
 
 uv run scripts/compute_norm_stats.py \
   --config-name pi05_umi_dual_franka_cardboard_box_absolute_long_episode
+
+uv run scripts/compute_norm_stats.py \
+  --config-name pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode
 ```
 
-They write two additional, independent files:
+They write three additional, independent files (paths relative to the
+configured `assets_base_dir`):
 
 ```text
-assets/pi05_umi_dual_franka_cardboard_box_relative_long_episode/byang11259/cardboard_box_tcp_curated/norm_stats.json
-assets/pi05_umi_dual_franka_cardboard_box_absolute_long_episode/byang11259/cardboard_box_tcp_curated/norm_stats.json
+assets/pi05_umi_dual_franka_cardboard_box_relative_long_episode/local/cardboard_box_tcp_curated_x264/norm_stats.json
+assets/pi05_umi_dual_franka_cardboard_box_absolute_long_episode/local/cardboard_box_tcp_curated_x264/norm_stats.json
+assets/pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode/local/cardboard_box_tcp_curated_x264/norm_stats.json
 ```
 
 The long relative stats include any fixed-anchor jumps across physical-box
-boundaries. Both long stats include source-end clamping/repetition. Treat
-those distributions as part of the ablation; do not replace them with logical
-stats to make the run appear better behaved. Inspect all four files and record
-their asset IDs with the experiments.
+boundaries. All long stats include source-end clamping/repetition. The
+gripper-only file's `state` stats are 2-D; its action stats follow the same
+relative distribution as the relative config. Treat those distributions as
+part of the ablation; do not replace them with logical stats to make the run
+appear better behaved. Inspect all five files and record their asset IDs with
+the experiments.
 
 ## JAX training on H200
 
@@ -871,8 +932,11 @@ implausible Cartesian magnitudes.
 
 ### Original long-source training (ablation)
 
-After computing the two long-source norm-stat files, compile and execute two
-steps for each long config:
+After computing the three long-source norm-stat files, compile and execute two
+steps for each long config (append the equivalent
+`pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode`
+commands with `--exp-name=fold_box_relative_gripper_only_smoke` /
+`fold_box_relative_gripper_only_v1`):
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
@@ -897,8 +961,8 @@ CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 ```
 
 Confirm that each smoke run loads its own
-`byang11259/cardboard_box_tcp_curated` asset tree. Then run the full
-long-source experiments:
+`local/cardboard_box_tcp_curated_x264` asset tree under its config-name
+directory. Then run the full long-source experiments:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
@@ -912,7 +976,8 @@ CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
   --exp-name=fold_box_absolute_long_episode_v1
 ```
 
-The same one-H200 defaults apply. Cross-box chunks are expected here; stop
+The registered defaults apply (one-H200 for the full-state configs, 8-GPU
+batch-128 for the gripper-only config). Cross-box chunks are expected here; stop
 only if behavior differs from the documented stock semantics, values are
 non-finite, or transforms/cameras are wrong. Compare long relative versus long
 absolute to isolate the action representation within the unsegmented source
@@ -1007,6 +1072,17 @@ CUDA_VISIBLE_DEVICES=0 uv run scripts/serve_policy.py --port=8000 \
   --policy.dir=checkpoints/pi05_umi_dual_franka_cardboard_box_absolute_long_episode/fold_box_absolute_long_episode_v1/<step>
 ```
 
+Long-source gripper-only cross-embodiment variant (its WebSocket response is a
+**relative** chunk that the robot client must compose with its own saved
+anchors — see the deployment section):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run scripts/serve_policy.py --port=8000 \
+  policy:checkpoint \
+  --policy.config=pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode \
+  --policy.dir=checkpoints/pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode/fold_box_relative_gripper_only_v1/<step>
+```
+
 Serving support does not make a long-source checkpoint deployment-qualified.
 Keep it in offline/controller-disabled evaluation until it passes the same
 held-out, calibration, and safety gates as the recommended path.
@@ -1055,9 +1131,12 @@ CHW and validated floating image ranges before the shared resize/pad. Images
 must be timestamp-matched to the state. The server applies checkpoint
 normalization; the client must not pre-normalize state or actions.
 
-For **all four** configs the WebSocket response is an absolute raw action chunk
-with shape `[50, 16]` and the same left/right, `xyz + xyzw + gripper` layout as
-the raw state. For the relative config, the server-side output transform uses
+For the four full-state configs the WebSocket response is an absolute raw
+action chunk with shape `[50, 16]` and the same left/right,
+`xyz + xyzw + gripper` layout as the raw state. The gripper-only config
+instead returns a `[50, 16]` **relative** chunk in the same layout (see
+[Gripper-only-state cross-embodiment variant](#gripper-only-state-cross-embodiment-variant));
+its client must compose the chunk with its own saved query-time anchors. For the relative config, the server-side output transform uses
 the unnormalized state20 derived from that query as one immutable anchor for
 every waypoint, then returns absolute world-frame targets. Do not compose
 these returned targets a second time on the client. Either absolute baseline
@@ -1147,7 +1226,11 @@ The preflight suite and experiment checklist must cover:
 - independent, synchronized left and right anchors;
 - grippers remaining future absolute values with `1 = open`;
 - physical 20D stats and correct zero-padding/slicing to/from model 32D;
-- four separate norm-stat trees across representation and episode path;
+- five separate norm-stat trees across representation, state mode, and
+  episode path;
+- for the gripper-only config: a 2-D gripper state (no pose dimensions), a
+  relative served chunk, and client-side anchor composition matching the
+  offline transform;
 - online WebSocket transforms matching offline training transforms;
 - exactly two real camera streams, correct ordering, and an absent/masked base
   slot;

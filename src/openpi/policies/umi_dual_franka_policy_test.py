@@ -286,3 +286,47 @@ def test_zero_quaternion_and_non_pi05_are_rejected() -> None:
 
     with pytest.raises(ValueError, match=r"pi0\.5"):
         policy.UmiDualFrankaRelativeInputs(model_type=_model.ModelType.PI0)
+
+
+def test_gripper_only_inputs_emit_2d_state_and_keep_relative_actions() -> None:
+    state, actions = _sample_state_and_actions()
+    full = policy.UmiDualFrankaRelativeInputs(model_type=_model.ModelType.PI05)(_input_record(state, actions))
+    gripper_only = policy.UmiDualFrankaRelativeInputs(model_type=_model.ModelType.PI05, state_mode="gripper_only")(
+        _input_record(state, actions)
+    )
+
+    assert gripper_only["state"].shape == (policy.GRIPPER_STATE_DIM,)
+    np.testing.assert_allclose(gripper_only["state"], state[[7, 15]])
+    # The relative-action anchor must come from the full raw state, not the
+    # reduced policy state.
+    np.testing.assert_allclose(gripper_only["actions"], full["actions"])
+    assert gripper_only["image_mask"] == full["image_mask"]
+    np.testing.assert_array_equal(gripper_only["image"]["left_wrist_0_rgb"], full["image"]["left_wrist_0_rgb"])
+    assert gripper_only["prompt"] == full["prompt"]
+
+
+def test_gripper_only_outputs_return_relative_chunks_for_client_composition() -> None:
+    state, actions = _sample_state_and_actions()
+    relative = policy.raw16_actions_to_relative20(state, actions)
+    padded = np.pad(relative, ((0, 0), (0, 12)), constant_values=77.0)
+
+    served = policy.UmiDualFrankaRelativeGripperOnlyOutputs()({"actions": padded})["actions"]
+
+    assert served.shape == (2, policy.RAW_STATE_DIM)
+    for start in (3, 11):
+        np.testing.assert_allclose(np.linalg.norm(served[..., start : start + 4], axis=-1), 1.0, atol=1e-6)
+        assert np.all(served[..., start + 3] >= 0.0)
+    # The served chunk is exactly the relative decode against an identity anchor.
+    identity20 = policy.raw16_to_absolute20(_raw_pose())
+    _assert_same_raw_poses(served, policy.relative20_actions_to_raw16(identity20, relative))
+    # Client-side composition with the query anchor recovers the absolute targets.
+    composed = policy.relative20_actions_to_raw16(
+        policy.raw16_to_absolute20(state), policy.raw16_to_absolute20(served)
+    )
+    _assert_same_raw_poses(composed, actions)
+    np.testing.assert_allclose(served[..., [7, 15]], actions[..., [7, 15]], atol=1e-6)
+
+
+def test_gripper_only_rejects_unknown_state_mode() -> None:
+    with pytest.raises(ValueError, match="state_mode"):
+        policy.UmiDualFrankaRelativeInputs(model_type=_model.ModelType.PI05, state_mode="nope")  # type: ignore[arg-type]

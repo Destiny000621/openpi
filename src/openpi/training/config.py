@@ -454,9 +454,16 @@ class LeRobotUmiDualFrankaDataConfig(DataConfigFactory):
     representation used by the model. The relative variant additionally converts
     every action waypoint to a true SE(3) transform relative to the chunk-start
     state; the absolute baseline keeps action poses absolute.
+
+    ``state_mode="gripper_only"`` (relative actions only) reduces the policy
+    state to the 2-D absolute ``[left_gripper, right_gripper]`` vector — no
+    pose dimensions — and serves the action chunk in the relative frame for
+    client-side anchor composition. This keeps the policy free of
+    scene/marker-absolute pose for cross-embodiment use.
     """
 
     action_representation: Literal["relative", "absolute"] = "relative"
+    state_mode: Literal["full", "gripper_only"] = "full"
     default_prompt: str | None = None
 
     @override
@@ -475,13 +482,29 @@ class LeRobotUmiDualFrankaDataConfig(DataConfigFactory):
             ]
         )
 
+        if self.state_mode not in ("full", "gripper_only"):
+            raise ValueError(f"state_mode must be either 'full' or 'gripper_only', got {self.state_mode!r}")
+
         match self.action_representation:
             case "relative":
                 data_transforms = _transforms.Group(
-                    inputs=[umi_dual_franka_policy.UmiDualFrankaRelativeInputs(model_type=model_config.model_type)],
-                    outputs=[umi_dual_franka_policy.UmiDualFrankaRelativeOutputs()],
+                    inputs=[
+                        umi_dual_franka_policy.UmiDualFrankaRelativeInputs(
+                            model_type=model_config.model_type, state_mode=self.state_mode
+                        )
+                    ],
+                    outputs=[
+                        umi_dual_franka_policy.UmiDualFrankaRelativeGripperOnlyOutputs()
+                        if self.state_mode == "gripper_only"
+                        else umi_dual_franka_policy.UmiDualFrankaRelativeOutputs()
+                    ],
                 )
             case "absolute":
+                if self.state_mode != "full":
+                    raise ValueError(
+                        "state_mode='gripper_only' requires action_representation='relative'; "
+                        "the absolute baseline decodes world-frame targets and needs absolute state."
+                    )
                 data_transforms = _transforms.Group(
                     inputs=[umi_dual_franka_policy.UmiDualFrankaAbsoluteInputs(model_type=model_config.model_type)],
                     outputs=[umi_dual_franka_policy.UmiDualFrankaAbsoluteOutputs()],
@@ -1469,6 +1492,27 @@ _CONFIGS = [
         num_train_steps=5_000,
         batch_size=32,
         fsdp_devices=1,
+        num_workers=8,
+        save_interval=5_000,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # Cross-embodiment variant: relative actions with a 2-D gripper-only policy
+    # state (no pose dimensions). The server returns relative chunks; the
+    # robot client composes them with its own query-time TCP anchors.
+    TrainConfig(
+        name="pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotUmiDualFrankaDataConfig(
+            repo_id="local/cardboard_box_tcp_curated_x264",
+            default_prompt="Assemble the cardboard box and put it into the bin",
+            action_representation="relative",
+            state_mode="gripper_only",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10000,
+        batch_size=128,
+        fsdp_devices=8,
         num_workers=8,
         save_interval=5_000,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",

@@ -108,6 +108,9 @@ def main() -> None:
         [*data_config.repack_transforms.inputs, *data_config.data_transforms.inputs],
     )
     decode_actions = _transforms.compose(data_config.data_transforms.outputs)
+    gripper_only = isinstance(
+        data_config.data_transforms.outputs[0], umi_policy.UmiDualFrankaRelativeGripperOnlyOutputs
+    )
     indices = _sample_full_chunk_indices(
         raw_single,
         action_horizon=horizon,
@@ -133,8 +136,13 @@ def main() -> None:
         item = transformed[index]
         model_state = np.asarray(item["state"])
         model_actions = np.asarray(item["actions"])
-        if model_state.shape != (umi_policy.MODEL_STATE_DIM,):
-            raise ValueError(f"Transformed state must be 20-D, got {model_state.shape}")
+        expected_state_dim = umi_policy.GRIPPER_STATE_DIM if gripper_only else umi_policy.MODEL_STATE_DIM
+        if model_state.shape != (expected_state_dim,):
+            raise ValueError(f"Transformed state must be {expected_state_dim}-D, got {model_state.shape}")
+        if gripper_only:
+            gripper_state_error = float(np.max(np.abs(model_state - raw_states[0][[7, 15]])))
+            if gripper_state_error > 1e-6:
+                raise ValueError(f"gripper-only state must equal the raw gripper values, error {gripper_state_error}")
         if model_actions.shape != (horizon, umi_policy.MODEL_STATE_DIM):
             raise ValueError(f"Transformed actions must have shape {(horizon, 20)}, got {model_actions.shape}")
         if item["image_mask"] != {
@@ -145,6 +153,13 @@ def main() -> None:
             raise ValueError(f"Unexpected image mask: {item['image_mask']}")
 
         decoded = decode_actions({"state": model_state, "actions": model_actions})["actions"]
+        if gripper_only:
+            # The server returns a relative chunk; emulate the documented
+            # client-side composition with the query-time anchor.
+            decoded = umi_policy.relative20_actions_to_raw16(
+                umi_policy.raw16_to_absolute20(raw_states[0]),
+                umi_policy.raw16_to_absolute20(decoded),
+            )
         expected = raw_actions
         max_position_roundtrip_error = max(
             max_position_roundtrip_error,

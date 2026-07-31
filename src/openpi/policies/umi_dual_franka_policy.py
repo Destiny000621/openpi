@@ -5,12 +5,18 @@ arm then right arm.  Each arm block is::
 
     [x, y, z, qx, qy, qz, qw, gripper]
 
-This module exposes two paired representations for pi0.5:
+This module exposes three representations for pi0.5:
 
 * ``UmiDualFrankaRelativeInputs/Outputs`` (primary): absolute 20-D state and
   true SE(3), chunk-start-relative 20-D actions.
 * ``UmiDualFrankaAbsoluteInputs/Outputs`` (baseline): absolute 20-D state and
   absolute 20-D actions.
+* ``UmiDualFrankaRelativeInputs(state_mode="gripper_only")`` paired with
+  ``UmiDualFrankaRelativeGripperOnlyOutputs`` (cross-embodiment variant): the
+  policy state is the 2-D ``[left_gripper, right_gripper]`` vector — no pose
+  dimensions at all — while actions stay fixed-anchor relative. The served
+  chunk remains in the relative frame; the robot client composes it with its
+  own query-time TCP anchors.
 
 Each 20-D arm block is ``[xyz, rotation_6d, gripper]``.  The rotation-6D
 convention is the first two *rows* of a rotation matrix, flattened row-major.
@@ -19,6 +25,7 @@ SO(3).  Do not mix this encoder with a column-based rotation-6D decoder.
 """
 
 import dataclasses
+from typing import Literal
 
 import numpy as np
 
@@ -29,6 +36,7 @@ RAW_ARM_DIM = 8
 RAW_STATE_DIM = 2 * RAW_ARM_DIM
 MODEL_ARM_DIM = 10
 MODEL_STATE_DIM = 2 * MODEL_ARM_DIM
+GRIPPER_STATE_DIM = 2
 
 _EPS = 1e-8
 _MISSING = object()
@@ -232,6 +240,20 @@ def absolute20_to_raw16(absolute: np.ndarray) -> np.ndarray:
     return np.concatenate(blocks, axis=-1)
 
 
+def raw16_to_gripper_state2(raw: np.ndarray) -> np.ndarray:
+    """Extract the 2-D ``[left_gripper, right_gripper]`` policy state.
+
+    Used by the gripper-only state mode: with a single observation timestep,
+    pose-relative proprioception is identically zero, so the absolute pose is
+    the only pose signal — and it is scene/marker specific. Dropping it keeps
+    the policy embodiment-agnostic. Grippers stay absolute in ``[0, 1]`` with
+    ``1 = open``.
+    """
+    raw = _as_float_array(raw, name="raw state")
+    _require_last_dim(raw, RAW_STATE_DIM, name="raw state")
+    return raw[..., (RAW_ARM_DIM - 1, RAW_STATE_DIM - 1)]
+
+
 def raw16_actions_to_relative20(current_raw_state: np.ndarray, future_raw_actions: np.ndarray) -> np.ndarray:
     """Encode every future waypoint relative to the same current-state anchor.
 
@@ -299,6 +321,19 @@ def relative20_actions_to_raw16(current_absolute20_state: np.ndarray, relative20
     return np.concatenate(blocks, axis=-1)
 
 
+def relative20_actions_to_relative_raw16(relative20_actions: np.ndarray) -> np.ndarray:
+    """Convert relative 20-D waypoints to raw-layout **relative** 16-D chunks.
+
+    This is a pure representation change (rotation-6D to quaternion, identical
+    math to ``absolute20_to_raw16``); the values stay fixed-anchor relative.
+    Each arm block is ``[rel_xyz, rel_quat_xyzw, future_gripper_abs]``, with the
+    translation and rotation still expressed in that arm's query-time TCP
+    frame. The robot client composes every waypoint with its own saved
+    query-time anchor: ``T_world_tcp_pred[k] = T_world_tcp_query @ T_rel[k]``.
+    """
+    return absolute20_to_raw16(relative20_actions)
+
+
 def _get_first(data: dict, keys: tuple[str, ...], *, name: str, optional: bool = False):
     for key in keys:
         if key in data:
@@ -363,7 +398,9 @@ def _validate_model_type(model_type: _model.ModelType) -> None:
         raise ValueError(f"UMI dual-Franka transforms are defined for pi0.5, got model type {model_type}.")
 
 
-def _build_inputs(data: dict, *, relative_actions: bool) -> dict:
+def _build_inputs(data: dict, *, relative_actions: bool, state_mode: str = "full") -> dict:
+    if state_mode not in ("full", "gripper_only"):
+        raise ValueError(f"state_mode must be either 'full' or 'gripper_only', got {state_mode!r}.")
     raw_state = _get_first(
         data,
         ("observation/state", "observation.state", "state"),
@@ -372,10 +409,14 @@ def _build_inputs(data: dict, *, relative_actions: bool) -> dict:
     raw_state = _as_float_array(raw_state, name="raw dual-Franka state")
     _require_last_dim(raw_state, RAW_STATE_DIM, name="raw dual-Franka state")
 
+    # The relative-action anchor below always uses the full raw state; only the
+    # emitted policy state shrinks in gripper-only mode.
+    state = raw16_to_gripper_state2(raw_state) if state_mode == "gripper_only" else raw16_to_absolute20(raw_state)
+
     left_image = _parse_image(_get_image(data, "left_head"), name="left_head")
     right_image = _parse_image(_get_image(data, "right_head"), name="right_head")
     inputs = {
-        "state": raw16_to_absolute20(raw_state),
+        "state": state,
         "image": {
             "base_0_rgb": np.zeros_like(left_image),
             "left_wrist_0_rgb": left_image,
@@ -406,15 +447,23 @@ def _build_inputs(data: dict, *, relative_actions: bool) -> dict:
 
 @dataclasses.dataclass(frozen=True)
 class UmiDualFrankaRelativeInputs(transforms.DataTransformFn):
-    """Map raw UMI observations/actions to the primary pi0.5 representation."""
+    """Map raw UMI observations/actions to the primary pi0.5 representation.
+
+    With ``state_mode="gripper_only"`` the emitted policy state is the 2-D
+    ``[left_gripper, right_gripper]`` vector; the relative action encoding is
+    unchanged (its anchor is always the full raw absolute state).
+    """
 
     model_type: _model.ModelType
+    state_mode: Literal["full", "gripper_only"] = "full"
 
     def __post_init__(self) -> None:
         _validate_model_type(self.model_type)
+        if self.state_mode not in ("full", "gripper_only"):
+            raise ValueError(f"state_mode must be either 'full' or 'gripper_only', got {self.state_mode!r}.")
 
     def __call__(self, data: dict) -> dict:
-        return _build_inputs(data, relative_actions=True)
+        return _build_inputs(data, relative_actions=True, state_mode=self.state_mode)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -429,6 +478,25 @@ class UmiDualFrankaRelativeOutputs(transforms.DataTransformFn):
         if state.ndim < 1 or state.shape[-1] < MODEL_STATE_DIM:
             raise ValueError(f"model state must have at least {MODEL_STATE_DIM} values, got {state.shape}.")
         return {"actions": relative20_actions_to_raw16(state[..., :MODEL_STATE_DIM], actions[..., :MODEL_STATE_DIM])}
+
+
+@dataclasses.dataclass(frozen=True)
+class UmiDualFrankaRelativeGripperOnlyOutputs(transforms.DataTransformFn):
+    """Decode unnormalized relative model actions to raw-layout relative 16-D chunks.
+
+    The gripper-only configs deliberately keep absolute pose out of the policy,
+    so the server cannot compose an absolute anchor. The response stays in the
+    relative frame: per arm ``[rel_xyz, rel_quat_xyzw, gripper_abs]``. The
+    robot client composes ``T_world_tcp_pred[k] = T_world_tcp_query @
+    T_rel_pred[k]`` per arm with its own saved query-time anchor, following the
+    same fixed-anchor rules as the primary relative config.
+    """
+
+    def __call__(self, data: dict) -> dict:
+        actions = _as_float_array(data["actions"], name="model actions")
+        if actions.ndim < 1 or actions.shape[-1] < MODEL_STATE_DIM:
+            raise ValueError(f"model actions must have at least {MODEL_STATE_DIM} values, got {actions.shape}.")
+        return {"actions": relative20_actions_to_relative_raw16(actions[..., :MODEL_STATE_DIM])}
 
 
 @dataclasses.dataclass(frozen=True)
