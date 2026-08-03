@@ -464,6 +464,9 @@ class LeRobotUmiDualFrankaDataConfig(DataConfigFactory):
 
     action_representation: Literal["relative", "absolute"] = "relative"
     state_mode: Literal["full", "gripper_only"] = "full"
+    # Optional centered square crop (pixel side length) applied to both camera
+    # views in the shared input transform, before the model resize.
+    image_crop: int | None = None
     default_prompt: str | None = None
 
     @override
@@ -490,7 +493,9 @@ class LeRobotUmiDualFrankaDataConfig(DataConfigFactory):
                 data_transforms = _transforms.Group(
                     inputs=[
                         umi_dual_franka_policy.UmiDualFrankaRelativeInputs(
-                            model_type=model_config.model_type, state_mode=self.state_mode
+                            model_type=model_config.model_type,
+                            state_mode=self.state_mode,
+                            image_crop=self.image_crop,
                         )
                     ],
                     outputs=[
@@ -506,7 +511,11 @@ class LeRobotUmiDualFrankaDataConfig(DataConfigFactory):
                         "the absolute baseline decodes world-frame targets and needs absolute state."
                     )
                 data_transforms = _transforms.Group(
-                    inputs=[umi_dual_franka_policy.UmiDualFrankaAbsoluteInputs(model_type=model_config.model_type)],
+                    inputs=[
+                        umi_dual_franka_policy.UmiDualFrankaAbsoluteInputs(
+                            model_type=model_config.model_type, image_crop=self.image_crop
+                        )
+                    ],
                     outputs=[umi_dual_franka_policy.UmiDualFrankaAbsoluteOutputs()],
                 )
             case _:
@@ -1337,6 +1346,49 @@ _CONFIGS = [
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
+    
+    # add vial correction data
+    TrainConfig(
+        name="pi05_yam_vial_30fps_aug_correction",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/vial_correction_v21",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            adapt_to_pi=False,
+            default_prompt="pick up all vials and place them in the stand",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head_camera",
+                                "cam_left_wrist": "observation.images.left_wrist_camera",
+                                "cam_right_wrist": "observation.images.right_wrist_camera",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        # Warm-start from the vial-aug checkpoint (step 10000) instead of pi05_base.
+        # CheckpointWeightLoader takes the `params/` dir of a trained checkpoint;
+        # it loads model weights only (optimizer state + step counter reset), so
+        # this is a fresh 3k-step fine-tune on top of those weights.
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/mnt/localssd/Sichang/openpi-checkpoints/pi05_yam_vial_4_30fps_aug/v1/10000/params"
+        ),
+        num_train_steps=3_000,
+        batch_size=64,
+        fsdp_devices=4,
+        num_workers=4,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
     #
     # ABC-130k (XDOF) single-task YAM configs. MCAP episodes converted to v2.1 by
     # scripts/convert_abc_mcap_to_lerobot_v21.py (yam_finetune.md §"Fine-tuning
@@ -1419,6 +1471,45 @@ _CONFIGS = [
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
+    # ABC-130k sort_the_legos_into_containers_by_color: first 500 of 4458 MCAP
+    # episodes (sorted by uuid) converted the same way as pi05_yam_abc_earbuds.
+    TrainConfig(
+        name="pi05_yam_abc_sort_legos",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/abc_sort_legos_v21",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            adapt_to_pi=False,
+            default_prompt="sort the legos into containers by color",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head_camera",
+                                "cam_left_wrist": "observation.images.left_wrist_camera",
+                                "cam_right_wrist": "observation.images.right_wrist_camera",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        batch_size=128,
+        fsdp_devices=4,
+        num_workers=16,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
     #
     # Dual-arm Franka UMI cardboard-box configs.
     #
@@ -1497,6 +1588,30 @@ _CONFIGS = [
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
+    # Cross-embodiment variant with cropped views: same as the gripper-only
+    # config below, plus a centered 272 px crop of both 384 px fisheye views
+    # (largest square inscribed in the fisheye circle) applied in the shared
+    # input transform. Removes the dead black corners and most scene/operator
+    # periphery and magnifies the workspace ~1.4x after the model resize.
+    TrainConfig(
+        name="pi05_umi_dual_franka_cardboard_box_relative_gripper_only_crop272_long_episode",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotUmiDualFrankaDataConfig(
+            repo_id="local/cardboard_box_tcp_curated_x264",
+            default_prompt="Assemble the cardboard box and put it into the bin",
+            action_representation="relative",
+            state_mode="gripper_only",
+            image_crop=272,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10000,
+        batch_size=128,
+        fsdp_devices=8,
+        num_workers=8,
+        save_interval=5_000,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
     # Cross-embodiment variant: relative actions with a 2-D gripper-only policy
     # state (no pose dimensions). The server returns relative chunks; the
     # robot client composes them with its own query-time TCP anchors.
@@ -1504,10 +1619,11 @@ _CONFIGS = [
         name="pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
         data=LeRobotUmiDualFrankaDataConfig(
-            repo_id="local/cardboard_box_tcp_curated_x264",
+            repo_id="local/cardboard_box_tcp_curated_10s_x264",
             default_prompt="Assemble the cardboard box and put it into the bin",
             action_representation="relative",
             state_mode="gripper_only",
+            image_crop=200,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=10000,

@@ -398,7 +398,29 @@ def _validate_model_type(model_type: _model.ModelType) -> None:
         raise ValueError(f"UMI dual-Franka transforms are defined for pi0.5, got model type {model_type}.")
 
 
-def _build_inputs(data: dict, *, relative_actions: bool, state_mode: str = "full") -> dict:
+def center_crop_image(image: np.ndarray, side: int, *, name: str) -> np.ndarray:
+    """Center-crop an HWC image to a ``side x side`` square.
+
+    Used to trim the fisheye frame before the model resize: a 272 px crop of
+    the 384 px ``front_equi`` view is the largest square inscribed in the
+    fisheye circle, removing the dead black corners and most of the
+    scene/operator periphery while keeping the gripper fingers and workspace.
+    Applied in the shared input transform so training and serving stay
+    identical.
+    """
+    if image.ndim != 3:
+        raise ValueError(f"{name} must be a 3-D HWC image, got {image.shape}.")
+    height, width = image.shape[0], image.shape[1]
+    if side <= 0 or side > min(height, width):
+        raise ValueError(f"image_crop must lie in (0, {min(height, width)}] for {name} of shape {image.shape}, got {side}.")
+    top = (height - side) // 2
+    left = (width - side) // 2
+    return np.ascontiguousarray(image[top : top + side, left : left + side])
+
+
+def _build_inputs(
+    data: dict, *, relative_actions: bool, state_mode: str = "full", image_crop: int | None = None
+) -> dict:
     if state_mode not in ("full", "gripper_only"):
         raise ValueError(f"state_mode must be either 'full' or 'gripper_only', got {state_mode!r}.")
     raw_state = _get_first(
@@ -415,6 +437,9 @@ def _build_inputs(data: dict, *, relative_actions: bool, state_mode: str = "full
 
     left_image = _parse_image(_get_image(data, "left_head"), name="left_head")
     right_image = _parse_image(_get_image(data, "right_head"), name="right_head")
+    if image_crop is not None:
+        left_image = center_crop_image(left_image, image_crop, name="left_head")
+        right_image = center_crop_image(right_image, image_crop, name="right_head")
     inputs = {
         "state": state,
         "image": {
@@ -456,6 +481,9 @@ class UmiDualFrankaRelativeInputs(transforms.DataTransformFn):
 
     model_type: _model.ModelType
     state_mode: Literal["full", "gripper_only"] = "full"
+    # Optional centered square crop (pixel side length) applied to both camera
+    # views before the model resize, e.g. 272 for the 384 px fisheye views.
+    image_crop: int | None = None
 
     def __post_init__(self) -> None:
         _validate_model_type(self.model_type)
@@ -463,7 +491,9 @@ class UmiDualFrankaRelativeInputs(transforms.DataTransformFn):
             raise ValueError(f"state_mode must be either 'full' or 'gripper_only', got {self.state_mode!r}.")
 
     def __call__(self, data: dict) -> dict:
-        return _build_inputs(data, relative_actions=True, state_mode=self.state_mode)
+        return _build_inputs(
+            data, relative_actions=True, state_mode=self.state_mode, image_crop=self.image_crop
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -504,12 +534,13 @@ class UmiDualFrankaAbsoluteInputs(transforms.DataTransformFn):
     """Map raw UMI observations/actions to the absolute-action pi0.5 baseline."""
 
     model_type: _model.ModelType
+    image_crop: int | None = None
 
     def __post_init__(self) -> None:
         _validate_model_type(self.model_type)
 
     def __call__(self, data: dict) -> dict:
-        return _build_inputs(data, relative_actions=False)
+        return _build_inputs(data, relative_actions=False, image_crop=self.image_crop)
 
 
 @dataclasses.dataclass(frozen=True)

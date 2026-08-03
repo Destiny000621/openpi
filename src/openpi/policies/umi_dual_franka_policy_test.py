@@ -330,3 +330,34 @@ def test_gripper_only_outputs_return_relative_chunks_for_client_composition() ->
 def test_gripper_only_rejects_unknown_state_mode() -> None:
     with pytest.raises(ValueError, match="state_mode"):
         policy.UmiDualFrankaRelativeInputs(model_type=_model.ModelType.PI05, state_mode="nope")  # type: ignore[arg-type]
+
+
+def test_image_crop_trims_views_and_leaves_state_actions_unchanged() -> None:
+    state, actions = _sample_state_and_actions()
+    record = _input_record(state, actions)
+    full = policy.UmiDualFrankaRelativeInputs(model_type=_model.ModelType.PI05, state_mode="gripper_only")(
+        dict(record)
+    )
+    cropped = policy.UmiDualFrankaRelativeInputs(
+        model_type=_model.ModelType.PI05, state_mode="gripper_only", image_crop=3
+    )(dict(record))
+
+    # The 5x7 test images crop to the centered 3x3 square: rows 1..3, cols 2..4.
+    assert cropped["image"]["left_wrist_0_rgb"].shape == (3, 3, 3)
+    np.testing.assert_array_equal(
+        cropped["image"]["left_wrist_0_rgb"], full["image"]["left_wrist_0_rgb"][1:4, 2:5]
+    )
+    np.testing.assert_array_equal(
+        cropped["image"]["right_wrist_0_rgb"], full["image"]["right_wrist_0_rgb"][1:4, 2:5]
+    )
+    assert cropped["image"]["base_0_rgb"].shape == (3, 3, 3)
+    np.testing.assert_allclose(cropped["state"], full["state"])
+    np.testing.assert_allclose(cropped["actions"], full["actions"])
+
+
+def test_image_crop_rejects_out_of_range_sides() -> None:
+    state, actions = _sample_state_and_actions()
+    for bad in (0, -1, 6):
+        transform = policy.UmiDualFrankaRelativeInputs(model_type=_model.ModelType.PI05, image_crop=bad)
+        with pytest.raises(ValueError, match="image_crop"):
+            transform(_input_record(state, actions))

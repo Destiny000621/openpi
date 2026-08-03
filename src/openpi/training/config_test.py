@@ -8,6 +8,7 @@ import openpi.transforms as transforms
 
 _LOGICAL_REPO_ID = "local/cardboard_box_tcp_curated_logical_train"
 _LONG_REPO_ID = "local/cardboard_box_tcp_curated_x264"
+_TEN_S_REPO_ID = "local/cardboard_box_tcp_curated_10s_x264"
 _PROMPT = "Assemble the cardboard box and put it into the bin"
 
 
@@ -52,7 +53,7 @@ _PROMPT = "Assemble the cardboard box and put it into the bin"
         ),
         (
             "pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode",
-            _LONG_REPO_ID,
+            _TEN_S_REPO_ID,
             "relative",
             "gripper_only",
             umi_dual_franka_policy.UmiDualFrankaRelativeInputs,
@@ -211,3 +212,56 @@ def test_long_episode_config_delegates_50_step_chunking_to_lerobot(monkeypatch, 
     assert captured["repo_id"] == _LONG_REPO_ID
     assert list(captured["delta_timestamps"]) == ["action"]
     np.testing.assert_allclose(captured["delta_timestamps"]["action"], np.arange(50) / Metadata.fps)
+
+
+def test_gripper_only_crop272_config_contract(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        _config.DataConfigFactory,
+        "_load_norm_stats",
+        lambda self, assets_dir, asset_id: None,
+    )
+    monkeypatch.setattr(
+        _config.ModelTransformFactory,
+        "__call__",
+        lambda self, model_config: transforms.Group(),
+    )
+
+    train_config = _config.get_config("pi05_umi_dual_franka_cardboard_box_relative_gripper_only_crop272_long_episode")
+    assert train_config.data.action_representation == "relative"
+    assert train_config.data.state_mode == "gripper_only"
+    assert train_config.data.image_crop == 272
+    assert train_config.data.repo_id == _LONG_REPO_ID
+    assert train_config.batch_size == 128
+    assert train_config.fsdp_devices == 8
+    assert train_config.num_train_steps == 10_000
+
+    data_config = train_config.data.create(tmp_path, train_config.model)
+    inputs = data_config.data_transforms.inputs[0]
+    assert isinstance(inputs, umi_dual_franka_policy.UmiDualFrankaRelativeInputs)
+    assert inputs.image_crop == 272
+    assert isinstance(
+        data_config.data_transforms.outputs[0], umi_dual_franka_policy.UmiDualFrankaRelativeGripperOnlyOutputs
+    )
+
+
+def test_gripper_only_long_episode_uses_10s_dataset_with_crop200(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        _config.DataConfigFactory,
+        "_load_norm_stats",
+        lambda self, assets_dir, asset_id: None,
+    )
+    monkeypatch.setattr(
+        _config.ModelTransformFactory,
+        "__call__",
+        lambda self, model_config: transforms.Group(),
+    )
+
+    train_config = _config.get_config("pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode")
+    assert train_config.data.repo_id == _TEN_S_REPO_ID
+    assert train_config.data.state_mode == "gripper_only"
+    assert train_config.data.image_crop == 200
+
+    data_config = train_config.data.create(tmp_path, train_config.model)
+    inputs = data_config.data_transforms.inputs[0]
+    assert isinstance(inputs, umi_dual_franka_policy.UmiDualFrankaRelativeInputs)
+    assert inputs.image_crop == 200

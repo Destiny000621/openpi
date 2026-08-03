@@ -27,7 +27,8 @@ representation and a controlled absolute-action baseline.
 | Logical box (recommended) | absolute baseline | `pi05_umi_dual_franka_cardboard_box_absolute` | `local/cardboard_box_tcp_curated_logical_train` |
 | Original source episode (ablation) | relative primary | `pi05_umi_dual_franka_cardboard_box_relative_long_episode` | `local/cardboard_box_tcp_curated_x264` |
 | Original source episode (ablation) | absolute baseline | `pi05_umi_dual_franka_cardboard_box_absolute_long_episode` | `local/cardboard_box_tcp_curated_x264` |
-| Original source episode (ablation) | gripper-only-state relative | `pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode` | `local/cardboard_box_tcp_curated_x264` |
+| 10s-segmented source episodes | gripper-only relative, 200 px crop | `pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode` | `local/cardboard_box_tcp_curated_10s_x264` |
+| Original source episode (ablation) | gripper-only relative, 272 px crop | `pi05_umi_dual_franka_cardboard_box_relative_gripper_only_crop272_long_episode` | `local/cardboard_box_tcp_curated_x264` |
 
 > [!NOTE]
 > The long-episode configs point at `local/cardboard_box_tcp_curated_x264`, a
@@ -40,7 +41,7 @@ representation and a controlled absolute-action baseline.
 > no B-frames make index-to-pts mapping exact and random access fast. See
 > `REENCODE_PROVENANCE.md` inside the derived dataset directory.
 
-All five configs:
+All six configs:
 
 - start from `gs://openpi-assets/checkpoints/pi05_base/params`;
 - use the same two cameras, 6D rotation encoding, prompt plumbing, horizon,
@@ -62,8 +63,8 @@ their representation is the same.
 
 The four full-state configs register portable one-H200 defaults: full
 fine-tuning, batch size 32, `fsdp_devices=1`, eight data workers, and 5,000
-steps. The gripper-only config registers an 8-GPU recipe instead: batch size
-128, `fsdp_devices=8`, 10,000 steps. On this machine all five configs use
+steps. The gripper-only configs register an 8-GPU recipe instead: batch size
+128, `fsdp_devices=8`, 10,000 steps. On this machine all six configs use
 `/mnt/localssd/Sichang/openpi-assets` and
 `/mnt/localssd/Sichang/openpi-checkpoints`.
 
@@ -508,6 +509,15 @@ relative primary so that pairwise comparison isolates action relativity.
 
 ### Gripper-only-state cross-embodiment variant
 
+> [!NOTE]
+> The registered `pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode`
+> config trains on `local/cardboard_box_tcp_curated_10s_x264` (the
+> finer-segmented 107-episode 10s dataset, x264 re-encode, episodes 100-103
+> relabeled from a placeholder to the standard task string) with
+> `image_crop=200` (see
+> [Cropped fisheye views](#cropped-fisheye-views-image_crop)). The
+> `_crop272_long_episode` sibling keeps the original 18-episode dataset.
+
 `pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode` keeps
 the fixed-anchor relative action20 exactly as the primary relative config but
 replaces the 20-D absolute state with the 2-D absolute gripper vector:
@@ -564,6 +574,47 @@ The two dataset streams are:
 | --- | --- | --- |
 | `left_head` | `left_wrist_0_rgb` | left Insta360 X5 `front_equi` |
 | `right_head` | `right_wrist_0_rgb` | right Insta360 X5 `front_equi` |
+
+### Cropped fisheye views (`image_crop`)
+
+The `image_crop` option on `LeRobotUmiDualFrankaDataConfig` applies a centered
+square crop to **both** camera views at load time, inside the shared input
+transform (`center_crop_image` in
+`src/openpi/policies/umi_dual_franka_policy.py`). The dataset videos are never
+modified; the review clips under the derived dataset's `crop_review/` folder
+are visualization artifacts only.
+
+Per-sample pipeline order:
+
+```text
+decode 384x384 frame
+  -> parse/validate (CHW->HWC, dtype/range, finiteness)
+  -> centered crop: top = left = (384 - side) // 2
+     (side 272 -> rows/cols 56..327; side 200 -> rows/cols 92..291)
+  -> masked base_0_rgb placeholder created at the cropped shape
+  -> ResizeImages(224, 224) model transform
+  -> pi0.5 image tensor
+```
+
+Because the crop then upsamples into the fixed 224 x 224 model input, it
+*increases* effective workspace resolution: 272 px keeps the largest square
+inscribed in the fisheye circle (kills the dead black corners, ~1.41x
+magnification); 200 px keeps the central 27% of pixel area (~1.9x
+magnification) and also removes most wall/operator periphery — pixels that
+show the human demonstrator during collection but a robot arm at deployment,
+a guaranteed train/deploy mismatch.
+
+Rules:
+
+- The crop runs identically at training, norm-stats computation, and serving.
+  Deployment clients keep sending full 384 x 384 frames; the server crops.
+  **Never pre-crop client-side** — that would crop twice.
+- Side lengths outside `(0, 384]` are rejected. Odd remainders round the
+  offset down (a 225 px crop sits half a pixel off-center).
+- Changing the crop is a new experiment: register a new config name, compute
+  its own fresh norm-stat tree, and retrain. Checkpoints are never valid
+  across different crops (or between cropped and uncropped configs).
+- State and action processing are completely unaffected by the crop.
 
 The two source cameras are the same model and projection. Their images are
 384 × 384 `front_equi` fisheye views at nominal 29.97 Hz. The π0.5
@@ -854,15 +905,19 @@ uv run scripts/compute_norm_stats.py \
 
 uv run scripts/compute_norm_stats.py \
   --config-name pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode
+
+uv run scripts/compute_norm_stats.py \
+  --config-name pi05_umi_dual_franka_cardboard_box_relative_gripper_only_crop272_long_episode
 ```
 
-They write three additional, independent files (paths relative to the
+They write four additional, independent files (paths relative to the
 configured `assets_base_dir`):
 
 ```text
 assets/pi05_umi_dual_franka_cardboard_box_relative_long_episode/local/cardboard_box_tcp_curated_x264/norm_stats.json
 assets/pi05_umi_dual_franka_cardboard_box_absolute_long_episode/local/cardboard_box_tcp_curated_x264/norm_stats.json
-assets/pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode/local/cardboard_box_tcp_curated_x264/norm_stats.json
+assets/pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode/local/cardboard_box_tcp_curated_10s_x264/norm_stats.json
+assets/pi05_umi_dual_franka_cardboard_box_relative_gripper_only_crop272_long_episode/local/cardboard_box_tcp_curated_x264/norm_stats.json
 ```
 
 The long relative stats include any fixed-anchor jumps across physical-box
@@ -870,7 +925,7 @@ boundaries. All long stats include source-end clamping/repetition. The
 gripper-only file's `state` stats are 2-D; its action stats follow the same
 relative distribution as the relative config. Treat those distributions as
 part of the ablation; do not replace them with logical stats to make the run
-appear better behaved. Inspect all five files and record their asset IDs with
+appear better behaved. Inspect all six files and record their asset IDs with
 the experiments.
 
 ## JAX training on H200
@@ -1226,8 +1281,8 @@ The preflight suite and experiment checklist must cover:
 - independent, synchronized left and right anchors;
 - grippers remaining future absolute values with `1 = open`;
 - physical 20D stats and correct zero-padding/slicing to/from model 32D;
-- five separate norm-stat trees across representation, state mode, and
-  episode path;
+- six separate norm-stat trees across representation, state mode, image
+  crop, and episode path;
 - for the gripper-only config: a 2-D gripper state (no pose dimensions), a
   relative served chunk, and client-side anchor composition matching the
   offline transform;
