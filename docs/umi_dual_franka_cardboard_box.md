@@ -28,6 +28,7 @@ representation and a controlled absolute-action baseline.
 | Original source episode (ablation) | relative primary | `pi05_umi_dual_franka_cardboard_box_relative_long_episode` | `local/cardboard_box_tcp_curated_x264` |
 | Original source episode (ablation) | absolute baseline | `pi05_umi_dual_franka_cardboard_box_absolute_long_episode` | `local/cardboard_box_tcp_curated_x264` |
 | 10s-segmented source episodes | gripper-only relative, 224 px crop | `pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode` | `local/cardboard_box_tcp_curated_10s_x264` |
+| Full vid7to54 source episodes | gripper-only relative, 224 px crop | `pi05_umi_dual_franka_cardboard_box_relative_gripper_only_vid7to54` | `local/cardboard_box_tcp_vid7to54_x264` |
 | Original source episode (ablation) | gripper-only relative, 272 px crop | `pi05_umi_dual_franka_cardboard_box_relative_gripper_only_crop272_long_episode` | `local/cardboard_box_tcp_curated_x264` |
 
 > [!NOTE]
@@ -41,7 +42,7 @@ representation and a controlled absolute-action baseline.
 > no B-frames make index-to-pts mapping exact and random access fast. See
 > `REENCODE_PROVENANCE.md` inside the derived dataset directory.
 
-All six configs:
+All seven configs:
 
 - start from `gs://openpi-assets/checkpoints/pi05_base/params`;
 - use the same two cameras, 6D rotation encoding, prompt plumbing, horizon,
@@ -64,7 +65,7 @@ their representation is the same.
 The four full-state configs register portable one-H200 defaults: full
 fine-tuning, batch size 32, `fsdp_devices=1`, eight data workers, and 5,000
 steps. The gripper-only configs register an 8-GPU recipe instead: batch size
-128, `fsdp_devices=8`, 10,000 steps. On this machine all six configs use
+128, `fsdp_devices=8`, 10,000 steps. On this machine all seven configs use
 `/mnt/localssd/Sichang/openpi-assets` and
 `/mnt/localssd/Sichang/openpi-checkpoints`.
 
@@ -926,7 +927,7 @@ boundaries. All long stats include source-end clamping/repetition. The
 gripper-only file's `state` stats are 2-D; its action stats follow the same
 relative distribution as the relative config. Treat those distributions as
 part of the ablation; do not replace them with logical stats to make the run
-appear better behaved. Inspect all six files and record their asset IDs with
+appear better behaved. Inspect all seven files and record their asset IDs with
 the experiments.
 
 ## JAX training on H200
@@ -1282,8 +1283,8 @@ The preflight suite and experiment checklist must cover:
 - independent, synchronized left and right anchors;
 - grippers remaining future absolute values with `1 = open`;
 - physical 20D stats and correct zero-padding/slicing to/from model 32D;
-- six separate norm-stat trees across representation, state mode, image
-  crop, and episode path;
+- seven separate norm-stat trees across representation, state mode, image
+  crop, and episode/dataset path;
 - for the gripper-only config: a 2-D gripper state (no pose dimensions), a
   relative served chunk, and client-side anchor composition matching the
   offline transform;

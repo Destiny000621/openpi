@@ -1308,14 +1308,19 @@ _CONFIGS = [
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
     # Sichang 2nd SFT: vials_4 (all 180 eps) augmented with 46 selected episodes from
-    # ttotmoon/8ml_vial_place_30fps (eps 0-40, 165, 167, 168, 172, 177) → 226 eps / 236,684 frames.
-    # Built with scripts/merge_lerobot_v21.py into local/vials_4_aug_8ml46_v21.
-    # Single prompt for all data (the 8ml single-vial demos are extra data for the 4-vial task).
+    # ttotmoon/8ml_vial_place_30fps (eps 0-40, 165, 167, 168, 172, 177) → 226 eps / 236,684 frames
+    # (local/vials_4_aug_8ml46_v21; this is what exp v1 trained on).
+    # v2 additionally folds in all 83 correction episodes from local/vial_correction_v21
+    # → 309 eps / 304,618 frames in local/vials_4_aug_8ml46_corr_v21.
+    # Both built with scripts/merge_lerobot_v21.py; the merge drops `phase`/`correction_index`,
+    # which only the correction dataset carries, since openpi does not consume them.
+    # Single prompt for all data (prompt_from_task=False, so default_prompt covers every frame;
+    # the 8ml single-vial demos are extra data for the 4-vial task).
     TrainConfig(
         name="pi05_yam_vial_4_30fps_aug",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAlohaDataConfig(
-            repo_id="local/vials_4_aug_8ml46_v21",
+            repo_id="local/vials_4_aug_8ml46_corr_v21",
             assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
                 asset_id="trossen",
@@ -1339,9 +1344,9 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=15_000,
-        batch_size=64,
-        fsdp_devices=8,
+        num_train_steps=10_000,
+        batch_size=80,
+        fsdp_devices=4,
         num_workers=8,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
@@ -1583,6 +1588,29 @@ _CONFIGS = [
         num_train_steps=5_000,
         batch_size=32,
         fsdp_devices=1,
+        num_workers=8,
+        save_interval=5_000,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # Full-source-set variant: identical recipe to the 10s gripper-only config
+    # (2-D gripper state, relative chunks, 224 px crop) on the complete
+    # vid7to54 export (46 session-length episodes, 205k frames, x264 re-encode;
+    # episodes 37-39 relabeled from a placeholder to the standard task string).
+    TrainConfig(
+        name="pi05_umi_dual_franka_cardboard_box_relative_gripper_only_vid7to54",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotUmiDualFrankaDataConfig(
+            repo_id="local/cardboard_box_tcp_vid7to54_x264",
+            default_prompt="Assemble the cardboard box and put it into the bin",
+            action_representation="relative",
+            state_mode="gripper_only",
+            image_crop=224,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10000,
+        batch_size=128,
+        fsdp_devices=8,
         num_workers=8,
         save_interval=5_000,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
