@@ -1623,7 +1623,7 @@ _CONFIGS = [
             default_prompt="Assemble the cardboard box and put it into the bin",
             action_representation="relative",
             state_mode="gripper_only",
-            image_crop=200,
+            image_crop=224,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=10000,

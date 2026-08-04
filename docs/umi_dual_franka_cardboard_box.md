@@ -27,7 +27,7 @@ representation and a controlled absolute-action baseline.
 | Logical box (recommended) | absolute baseline | `pi05_umi_dual_franka_cardboard_box_absolute` | `local/cardboard_box_tcp_curated_logical_train` |
 | Original source episode (ablation) | relative primary | `pi05_umi_dual_franka_cardboard_box_relative_long_episode` | `local/cardboard_box_tcp_curated_x264` |
 | Original source episode (ablation) | absolute baseline | `pi05_umi_dual_franka_cardboard_box_absolute_long_episode` | `local/cardboard_box_tcp_curated_x264` |
-| 10s-segmented source episodes | gripper-only relative, 200 px crop | `pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode` | `local/cardboard_box_tcp_curated_10s_x264` |
+| 10s-segmented source episodes | gripper-only relative, 224 px crop | `pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode` | `local/cardboard_box_tcp_curated_10s_x264` |
 | Original source episode (ablation) | gripper-only relative, 272 px crop | `pi05_umi_dual_franka_cardboard_box_relative_gripper_only_crop272_long_episode` | `local/cardboard_box_tcp_curated_x264` |
 
 > [!NOTE]
@@ -514,7 +514,7 @@ relative primary so that pairwise comparison isolates action relativity.
 > config trains on `local/cardboard_box_tcp_curated_10s_x264` (the
 > finer-segmented 107-episode 10s dataset, x264 re-encode, episodes 100-103
 > relabeled from a placeholder to the standard task string) with
-> `image_crop=200` (see
+> `image_crop=224` (see
 > [Cropped fisheye views](#cropped-fisheye-views-image_crop)). The
 > `_crop272_long_episode` sibling keeps the original 18-episode dataset.
 
@@ -590,7 +590,7 @@ Per-sample pipeline order:
 decode 384x384 frame
   -> parse/validate (CHW->HWC, dtype/range, finiteness)
   -> centered crop: top = left = (384 - side) // 2
-     (side 272 -> rows/cols 56..327; side 200 -> rows/cols 92..291)
+     (side 272 -> rows/cols 56..327; side 224 -> rows/cols 80..303)
   -> masked base_0_rgb placeholder created at the cropped shape
   -> ResizeImages(224, 224) model transform
   -> pi0.5 image tensor
@@ -599,8 +599,9 @@ decode 384x384 frame
 Because the crop then upsamples into the fixed 224 x 224 model input, it
 *increases* effective workspace resolution: 272 px keeps the largest square
 inscribed in the fisheye circle (kills the dead black corners, ~1.41x
-magnification); 200 px keeps the central 27% of pixel area (~1.9x
-magnification) and also removes most wall/operator periphery — pixels that
+magnification); 224 px equals the model's native input size, so the resize
+becomes a no-op — zero resampling, pixel-for-pixel sharp — with ~1.71x
+magnification, and also removes most wall/operator periphery — pixels that
 show the human demonstrator during collection but a robot arm at deployment,
 a guaranteed train/deploy mismatch.
 

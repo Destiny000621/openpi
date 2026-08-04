@@ -259,9 +259,9 @@ def test_gripper_only_long_episode_uses_10s_dataset_with_crop200(monkeypatch, tm
     train_config = _config.get_config("pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode")
     assert train_config.data.repo_id == _TEN_S_REPO_ID
     assert train_config.data.state_mode == "gripper_only"
-    assert train_config.data.image_crop == 200
+    assert train_config.data.image_crop == 224
 
     data_config = train_config.data.create(tmp_path, train_config.model)
     inputs = data_config.data_transforms.inputs[0]
     assert isinstance(inputs, umi_dual_franka_policy.UmiDualFrankaRelativeInputs)
-    assert inputs.image_crop == 200
+    assert inputs.image_crop == 224
