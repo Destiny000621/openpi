@@ -361,3 +361,30 @@ def test_image_crop_rejects_out_of_range_sides() -> None:
         transform = policy.UmiDualFrankaRelativeInputs(model_type=_model.ModelType.PI05, image_crop=bad)
         with pytest.raises(ValueError, match="image_crop"):
             transform(_input_record(state, actions))
+
+
+def test_neutralize_rot6d_action_norm_stats_passes_rot6d_through_quantile_norm() -> None:
+    import openpi.shared.normalize as normalize
+    import openpi.transforms as transforms
+
+    base = np.linspace(0.1, 2.0, 20)
+    stats = {
+        "state": normalize.NormStats(mean=np.zeros(2), std=np.ones(2), q01=-np.ones(2), q99=np.ones(2)),
+        "actions": normalize.NormStats(mean=base.copy(), std=base + 1, q01=base - 0.5, q99=base + 0.5),
+    }
+    patched = policy.neutralize_rot6d_action_norm_stats(stats)
+
+    rot = list(policy.ROT6D_ACTION_DIMS)
+    other = [i for i in range(20) if i not in rot]
+    actions = patched["actions"]
+    np.testing.assert_allclose(np.asarray(actions.q01)[rot], -1.0)
+    np.testing.assert_allclose(np.asarray(actions.q99)[rot], 1.0)
+    np.testing.assert_allclose(np.asarray(actions.q01)[other], (base - 0.5)[other])
+    np.testing.assert_allclose(np.asarray(patched["state"].q01), -np.ones(2))
+
+    sample = {"state": np.zeros(2), "actions": np.linspace(-0.9, 0.9, 20)}
+    normalized = transforms.Normalize(patched, use_quantiles=True)(dict(sample))
+    np.testing.assert_allclose(normalized["actions"][rot], sample["actions"][rot], atol=1e-5)
+    assert not np.allclose(normalized["actions"][other], sample["actions"][other])
+    restored = transforms.Unnormalize(patched, use_quantiles=True)(normalized)
+    np.testing.assert_allclose(restored["actions"], sample["actions"], atol=1e-5)

@@ -321,6 +321,43 @@ def relative20_actions_to_raw16(current_absolute20_state: np.ndarray, relative20
     return np.concatenate(blocks, axis=-1)
 
 
+ROT6D_ACTION_DIMS = (*range(3, 9), *range(MODEL_ARM_DIM + 3, MODEL_ARM_DIM + 9))
+
+
+def neutralize_rot6d_action_norm_stats(norm_stats: dict | None) -> dict | None:
+    """Return stats whose 12 rot6d action dims normalize to identity.
+
+    Neutral parameters (mean 0 / std 1 / q01 -1 / q99 +1) make both z-score and
+    quantile normalization pass rot6d values through unchanged (up to the
+    normalizer's 1e-6 epsilon). rot6d components are rotation-matrix entries,
+    inherently bounded in [-1, 1] and geometrically meaningful; skipping their
+    per-dim scaling keeps the training loss on the undistorted rotation
+    manifold and lets the network emit raw rot6d that feeds
+    ``rotation_6d_to_matrix`` directly. Translation and gripper dims keep
+    their data-driven statistics. Applied to stats FILES (not at load time) so
+    each checkpoint's embedded stats always describe its own training exactly.
+    """
+    if norm_stats is None or "actions" not in norm_stats:
+        return norm_stats
+
+    def _patched(array, value):
+        if array is None:
+            return None
+        flat = np.asarray(array).reshape(-1).copy()
+        flat[list(ROT6D_ACTION_DIMS)] = value
+        return flat
+
+    actions = norm_stats["actions"]
+    patched = dataclasses.replace(
+        actions,
+        mean=_patched(actions.mean, 0.0),
+        std=_patched(actions.std, 1.0),
+        q01=_patched(actions.q01, -1.0),
+        q99=_patched(actions.q99, 1.0),
+    )
+    return {**norm_stats, "actions": patched}
+
+
 def relative20_actions_to_relative_raw16(relative20_actions: np.ndarray) -> np.ndarray:
     """Convert relative 20-D waypoints to raw-layout **relative** 16-D chunks.
 

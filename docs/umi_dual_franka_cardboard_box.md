@@ -893,6 +893,28 @@ the asset ID is `local/cardboard_box_tcp_curated_logical_train`. Tiny spreads,
 unexpected translation magnitudes, gripper polarity changes, or padded
 dimensions in the physical stats are stop signs.
 
+### Raw-rot6d variant of the quantile stats
+
+rot6d components are rotation-matrix entries, inherently bounded in [-1, 1]
+and geometrically meaningful, so per-dim quantile scaling distorts the
+rotation manifold the loss is computed on. For runs that keep openpi's
+quantile normalization on translation and gripper dims (and the 2-D
+gripper-only state) but pass rot6d through raw — network output feeds
+``rotation_6d_to_matrix`` directly — neutralize the 12 rot6d action dims of
+the stats FILE after computing it:
+
+```bash
+uv run scripts/neutralize_rot6d_norm_stats.py \
+  --config-name pi05_umi_dual_franka_cardboard_box_relative_gripper_only_long_episode
+```
+
+This writes neutral parameters (mean 0 / std 1 / q01 -1 / q99 +1) into the
+rot6d entries, making the quantile normalizer an identity for them, and keeps
+a one-time ``norm_stats.json.pre_rot6d_neutral.bak`` backup. The file-level
+approach keeps every checkpoint self-consistent: each embeds the stats it
+trained with, so older full-normalization checkpoints under the same config
+still serve exactly as trained.
+
 ### Original long-source stats (ablation)
 
 These commands intentionally traverse the unsegmented source episodes through
