@@ -268,6 +268,113 @@ Deploy), gripper position (`joint_pos[7]`), the 7 arm `joint_pos` columns, all 8
 is `{"actions": np.f32(50, 8)}` — a chunk of absolute `target_pose` + gripper
 actions (renormalize the quaternion to unit on the robot side).
 
+## rot6d10 — relative-EEF variant (state + action both 10-D)
+
+The newer representation (RLinf-style), used by
+`pi05_franka_double_cable_left_r6` (trained on 36 curated
+`double_cable_insert_left` episodes; final loss 0.0068, checkpoints every 1k).
+**All pose dims — translation AND rotation — are learned relative to the current
+state; only the gripper is absolute.**
+
+```
+state  (10-D) = [ x, y, z, r6_0..r6_5, gripper ]   from ee_pose
+action (10-D) = [ x, y, z, r6_0..r6_5, gripper ]   from target_pose, stored ABSOLUTE
+```
+
+`r6` is the Zhou-et-al 6D rotation: the **first two columns of the rotation
+matrix**, concatenated `[c0x, c0y, c0z, c1x, c1y, c1z]`. Two properties matter:
+
+1. **Quat-sign-invariant** (`R(-q) = R(q)`) — the raw driver quats can sign-flip
+   mid-episode and split hemispheres (the double-cable recordings do both, at
+   qw≈0 where sign(qw) canonicalization is noise); rot6d makes all of that
+   structurally irrelevant. **No canonicalization anywhere** — converter or
+   client. No `quat_reference.json` in rot6d datasets.
+2. **Deltas cleanly** — `DeltaActions` subtracts rot6d componentwise; the result
+   isn't itself a rotation, but it's only a regression target: the inverse is
+   exact addition, and Gram-Schmidt after reconstruction restores orthonormality.
+
+### Pipeline
+
+```
+convert:  target_pose/ee_pose quat → R → [xyz, R[:,0], R[:,1], gripper]   (absolute, 10-D)
+train:    DeltaActions(make_bool_mask(9,-1)):  action[t][:9] -= state[:9]  ← relative
+          → quantile normalize → pad to 32 → pi0.5
+serve:    output32 → unnormalize → AbsoluteActions: action[t][:9] += state[:9]
+          → slice [:, :10] → response
+```
+
+The server **re-anchors every chunk to the request-time state and replies with
+ABSOLUTE poses** — there is no fixed-anchor composition on the client (unlike
+the UMI dual-arm pipeline). The relativity lives only inside the model.
+
+### Convert + config
+
+```bash
+uv run python scripts/convert_franka_raw_to_lerobot.py \
+    --input-dir /mnt/localssd/Sichang/double_cable_insert_left \
+    --repo-id local/double_cable_insert_left_r6_v21 \
+    --task "Unplug the two cables from the right router, then insert them into the left router" \
+    --fps 30 --rep rot6d10 \
+    --episode-list <file with one episode dir name per line>   # optional curation
+```
+
+`--rep quat8` reproduces the legacy 8-D/29-D datasets. In the TrainConfig, pair
+`action_representation="rot6d10"` with `state_dim=10`; norm-stats are a real
+recompute for a new dataset (all 9 pose action dims come out zero-centered:
+xyz ±~0.10 m, r6 ±~0.17 at q01/q99; gripper absolute [0, 0.79]).
+
+### Wire contract for the inference client (r6 checkpoints)
+
+Request — same keys as quat8, different state:
+
+```python
+# state (10,) from the live robot — NO quaternion canonicalization needed
+R = ee_pose.orientation.as_matrix()                    # scipy Rotation -> (3,3)
+rot6d = np.concatenate([R[:, 0], R[:, 1]])             # (6,)
+grip_rad = (1.0 - gripper_value) * 0.7929              # avantbot 1=open -> rad 0=open
+state = np.concatenate([ee_pose.position, rot6d, [grip_rad]]).astype(np.float32)
+
+request = {
+    "observation/state":       state,          # (10,)
+    "observation/image":       side_rgb,       # side / third-person camera
+    "observation/wrist_image": wrist_rgb,      # wrist camera
+    "prompt": "Unplug the two cables from the right router, then insert them into the left router",
+}
+```
+
+Response — `{"actions": np.f32(50, 10)}`, **absolute** `[xyz, rot6d, gripper]`.
+Parse each action:
+
+```python
+xyz, c0, c1, grip_rad = a[:3], a[3:6].copy(), a[6:9].copy(), float(a[9])
+# Gram-Schmidt -> valid rotation (model output is only approximately orthonormal)
+c0 /= np.linalg.norm(c0)
+c1 -= c0 * (c0 @ c1); c1 /= np.linalg.norm(c1)
+R = np.stack([c0, c1, np.cross(c0, c1)], axis=1)       # columns
+quat_xyzw = Rotation.from_matrix(R).as_quat()          # -> target orientation
+gripper_target = float(np.clip(1.0 - grip_rad / 0.7929, 0.0, 1.0))  # back to 1=open
+```
+
+Then command the absolute EE pose through the existing IK path exactly as for
+quat8. Client-side differences vs the quat8 contract, at a glance:
+
+| | quat8 client | rot6d10 client |
+|---|---|---|
+| state | 29-D (or 8-D lean), quat canonicalized via `quat_reference.json` | **10-D, no canonicalization** |
+| response | (50, 8) absolute quat pose | (50, 10) absolute rot6d pose |
+| orientation parse | renormalize quat | **Gram-Schmidt** two 3-vectors → R → quat |
+| gripper | radians ↔ [0,1] inversion (identical) | identical |
+
+Serve command (same shape as quat8):
+
+```bash
+uv run python scripts/serve_policy.py --port=8111 policy:checkpoint \
+  --policy.config=pi05_franka_double_cable_left_r6 \
+  --policy.dir=<checkpoint_base_dir>/pi05_franka_double_cable_left_r6/v1/3999
+```
+
+Control rate 30 Hz (match the dataset), `action_horizon=50`.
+
 ## Deploy on the robot — ⚠️ client mismatch
 
 Your intended inference client
@@ -289,6 +396,12 @@ avantbot client that
   Impedance controller. avantbot already resolves EE pose → joints for spacemouse
   intervention, so the IK path exists. Because `target_pose` is what the runner
   dispatched (Cartesian *and* joint-IK mode), this closes the loop cleanly.
+
+An EE-space client along these lines exists in avantbot as `franka_pi05_ee`
+(`avantbot/policies/pi0/franka_ee_client.py`) — it currently speaks the **quat8**
+contract. For rot6d10 checkpoints, update its state build + action parse per the
+[wire contract above](#wire-contract-for-the-inference-client-r6-checkpoints)
+(10-D state, Gram-Schmidt parse, no `quat_reference.json`).
 
 Match the client control rate to the dataset (`fps=30`); `action_horizon=50`.
 
