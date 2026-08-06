@@ -323,6 +323,29 @@ uv run python scripts/convert_franka_raw_to_lerobot.py \
 recompute for a new dataset (all 9 pose action dims come out zero-centered:
 xyz ±~0.10 m, r6 ±~0.17 at q01/q99; gripper absolute [0, 0.79]).
 
+### Normalization: rot6d bypasses it (`normalize_rot6d=False`)
+
+The standard going forward (`pi05_franka_double_cable_left_r6_rawrot`): **xyz and
+gripper are quantile-normalized; the six rot6d dims are NOT** — they pass through
+raw, since rotation-matrix entries already live in [-1, 1] and the network's
+rot6d output feeds `rotation_6d_to_matrix()` / Gram-Schmidt directly. Actions
+remain 10-D including rot6d — only the normalization map changes.
+
+Mechanism: with `normalize_rot6d=False` the data config replaces dims 3:9 of the
+loaded state/actions stats with identity-mapping values (`q01=-1, q99=+1`, which
+makes the quantile map `(x-q01)/(q99-q01)*2-1` exactly `x → x`; `mean=0, std=1`
+for z-score). Because train-time `Normalize`, the checkpoint's baked
+`assets/` stats (written from the same in-memory dict), and serve-time
+`Unnormalize` all consume `data_config.norm_stats`, the override is consistent
+across the whole lifecycle; the `norm_stats.json` on disk keeps the true
+computed statistics. The earlier `pi05_franka_double_cable_left_r6` config pins
+`normalize_rot6d=True` — its existing checkpoints trained with rot6d normalized
+and must keep serving that way.
+
+The inference **wire contract is unchanged** by this flag: the server still
+returns absolute `[xyz, rot6d, gripper]`; the client-side state build and
+Gram-Schmidt parse below apply as-is to both variants.
+
 ### Wire contract for the inference client (r6 checkpoints)
 
 Request — same keys as quat8, different state:

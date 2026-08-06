@@ -357,6 +357,34 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         )
 
 
+def _identity_rot6d_norm_stats(
+    norm_stats: dict[str, _transforms.NormStats],
+) -> dict[str, _transforms.NormStats]:
+    """Replace the rot6d dims (3:9) of 10-D state/actions stats with identity-mapping values.
+
+    q01=-1, q99=+1 makes quantile normalization (x - q01) / (q99 - q01) * 2 - 1 the
+    identity on those dims (up to the 1e-6 eps); mean=0, std=1 does the same for
+    z-score. Other dims keep their computed stats. Keys that are not 10-D
+    state/actions vectors pass through untouched.
+    """
+    out: dict[str, _transforms.NormStats] = {}
+    for key, stats in norm_stats.items():
+        if key not in ("state", "actions") or stats.mean.shape[-1] != 10:
+            out[key] = stats
+            continue
+        mean, std = stats.mean.copy(), stats.std.copy()
+        mean[..., 3:9] = 0.0
+        std[..., 3:9] = 1.0
+        q01 = None if stats.q01 is None else stats.q01.copy()
+        q99 = None if stats.q99 is None else stats.q99.copy()
+        if q01 is not None:
+            q01[..., 3:9] = -1.0
+        if q99 is not None:
+            q99[..., 3:9] = 1.0
+        out[key] = _normalize.NormStats(mean=mean, std=std, q01=q01, q99=q99)
+    return out
+
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotFrankaDataConfig(DataConfigFactory):
     """Data config for a single-arm Franka FR3 (29-D state, 8-D EE actions, 2 cameras).
@@ -397,6 +425,18 @@ class LeRobotFrankaDataConfig(DataConfigFactory):
     #              (xyz + rot6d relative-to-state, gripper absolute; RLinf-style).
     #              Pair with state_dim=10 and a *_r6_v21 dataset.
     action_representation: Literal["quat8", "rot6d10"] = "quat8"
+    # rot6d10 only. If False (the standard going forward), the rot6d dims (3:9 of
+    # both state and actions) BYPASS normalization: their stats are replaced at
+    # load time with identity-mapping values (q01=-1, q99=+1; mean=0, std=1), so
+    # the quantile map (x-q01)/(q99-q01)*2-1 reduces to x -> x. rot6d components
+    # are rotation-matrix entries already in [-1, 1] (and their relative deltas
+    # are small), so the network regresses raw geometry that feeds
+    # rotation_6d_to_matrix() directly. xyz and gripper keep openpi's normal
+    # quantile normalization. Because train-time Normalize, the checkpoint's
+    # baked assets (written from these in-memory stats), and serve-time
+    # Unnormalize all consume data_config.norm_stats, the identity override is
+    # consistent across the whole lifecycle. True stats stay on disk untouched.
+    normalize_rot6d: bool = True
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -443,8 +483,17 @@ class LeRobotFrankaDataConfig(DataConfigFactory):
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
+        base_config = self.create_base_config(assets_dirs, model_config)
+        if not self.normalize_rot6d:
+            if not rot6d:
+                raise ValueError("normalize_rot6d=False is only meaningful with action_representation='rot6d10'.")
+            if base_config.norm_stats is not None:
+                base_config = dataclasses.replace(
+                    base_config, norm_stats=_identity_rot6d_norm_stats(base_config.norm_stats)
+                )
+
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_config,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -1803,6 +1852,36 @@ _CONFIGS = [
             use_delta_joint_actions=True,
             state_dim=10,
             action_representation="rot6d10",
+            # This config's existing checkpoints (v1, loss 0.0068) trained with
+            # rot6d normalized — keep True here for provenance/resume; the
+            # raw-rot6d standard lives in the _rawrot config below.
+            normalize_rot6d=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=4_000,
+        save_interval=1_000,
+        keep_period=1_000,
+        batch_size=64,
+        fsdp_devices=4,
+        num_workers=32,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # Raw-rot6d variant (the standard going forward): identical to _r6 except the
+    # rot6d dims (3:9 of state AND actions) bypass normalization — the model
+    # regresses raw rotation-matrix columns (already in [-1,1]) that feed
+    # rotation_6d_to_matrix() directly; xyz + gripper keep quantile norm.
+    # Still 10-D actions including rot6d; only the normalization map changes.
+    TrainConfig(
+        name="pi05_franka_double_cable_left_r6_rawrot",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotFrankaDataConfig(
+            repo_id="local/double_cable_insert_left_r6_v21",
+            default_prompt="Unplug the two cables from the right router, then insert them into the left router",
+            use_delta_joint_actions=True,
+            state_dim=10,
+            action_representation="rot6d10",
+            normalize_rot6d=False,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=4_000,

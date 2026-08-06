@@ -77,6 +77,14 @@ class FrankaInputs(transforms.DataTransformFn):
                 f"state, got {state.shape}. 8-D-only datasets predate the 29-D schema — re-run "
                 "scripts/convert_franka_raw_to_lerobot.py or update the client."
             )
+        if self.state_dim == 10:
+            # rot6d10 state: dims 3:9 are rotation-matrix entries, mathematically in
+            # [-1, 1] but float rounding can nudge past ±1. The pi05 discrete-state
+            # tokenizer sends values strictly below -1 to bin "-1" (np.digitize
+            # underflow), so clamp the eps excursions. No-op for in-range values.
+            state = np.concatenate(
+                [state[..., :3], np.clip(state[..., 3:9], -1.0, 1.0), state[..., 9:]], axis=-1
+            )
         wrist_image = _parse_image(data["observation/wrist_image"])
         if self.wrist_camera_only:
             base_image = np.zeros_like(wrist_image)
