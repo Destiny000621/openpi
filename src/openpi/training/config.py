@@ -390,6 +390,13 @@ class LeRobotFrankaDataConfig(DataConfigFactory):
     # zeroed + masked off; the wrist stays in left_wrist_0_rgb. Same dataset,
     # no reconversion — controlled ablation of the third-person view.
     wrist_camera_only: bool = False
+    # Action/state representation the dataset was converted with:
+    #   "quat8":   action 8-D  [quat, xyz, gripper], delta mask (-4, 3, -1)
+    #              (xyz relative, quat + gripper absolute).
+    #   "rot6d10": action 10-D [xyz, rot6d, gripper], delta mask (9, -1)
+    #              (xyz + rot6d relative-to-state, gripper absolute; RLinf-style).
+    #              Pair with state_dim=10 and a *_r6_v21 dataset.
+    action_representation: Literal["quat8", "rot6d10"] = "quat8"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -408,6 +415,7 @@ class LeRobotFrankaDataConfig(DataConfigFactory):
             ]
         )
 
+        rot6d = self.action_representation == "rot6d10"
         data_transforms = _transforms.Group(
             inputs=[
                 franka_policy.FrankaInputs(
@@ -416,14 +424,18 @@ class LeRobotFrankaDataConfig(DataConfigFactory):
                     wrist_camera_only=self.wrist_camera_only,
                 )
             ],
-            outputs=[franka_policy.FrankaOutputs()],
+            outputs=[franka_policy.FrankaOutputs(action_dim=10 if rot6d else 8)],
         )
 
         if self.use_delta_joint_actions:
-            # quaternion (0-3) absolute, xyz (4-6) delta vs. state, gripper (7) absolute.
-            # The 8-dim mask only touches actions[:8]/state[:8]; the extra state
-            # proprio (dims 8-28) is never delta'd.
-            delta_action_mask = _transforms.make_bool_mask(-4, 3, -1)
+            if rot6d:
+                # xyz + rot6d (0-8) delta vs. state, gripper (9) absolute.
+                delta_action_mask = _transforms.make_bool_mask(9, -1)
+            else:
+                # quaternion (0-3) absolute, xyz (4-6) delta vs. state, gripper (7)
+                # absolute. The 8-dim mask only touches actions[:8]/state[:8]; the
+                # extra state proprio (dims 8-28) is never delta'd.
+                delta_action_mask = _transforms.make_bool_mask(-4, 3, -1)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -1344,14 +1356,19 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=10_000,
+        # exp recovery_v2 first ran 0->9999 at num_train_steps=10_000, then was extended to
+        # 15_000 and resumed from the 9999 checkpoint (--resume). Safe to extend because the
+        # default CosineDecaySchedule has a fixed decay_steps=30_000 that does NOT depend on
+        # num_train_steps, so the LR continues down the same curve (~2.0e-5 -> ~1.4e-5) with
+        # no discontinuity at the resume point.
+        num_train_steps=15_000,
         batch_size=80,
         fsdp_devices=4,
         num_workers=8,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
-    
+
     # add vial correction data
     TrainConfig(
         name="pi05_yam_vial_30fps_aug_correction",
@@ -1430,11 +1447,18 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=15_000,
-        save_interval=5_000,
+        # Extended 15k -> 18k steps (resume run, 2026-08-05): fine-tune from the
+        # existing 14999 checkpoint on cuda:0,1,2,3 (4 GPUs, once freed from another
+        # job) instead of the original 8. fsdp_devices matches visible device count;
+        # batch_size kept at the original global 64 (now 16/device, plenty of headroom
+        # on H200) for continuity with the run being resumed. save_interval dropped to
+        # 1k (vs. the original 5k) so a repeat of the external-SIGKILL incident loses
+        # at most ~1k steps instead of the whole 3k extension.
+        num_train_steps=18_000,
+        save_interval=1_000,
         keep_period=5_000,
         batch_size=64,
-        fsdp_devices=8,
+        fsdp_devices=4,
         num_workers=8,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
@@ -1511,7 +1535,7 @@ _CONFIGS = [
         keep_period=5_000,
         batch_size=128,
         fsdp_devices=4,
-        num_workers=16,
+        num_workers=32,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
@@ -1698,15 +1722,17 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotFrankaDataConfig(
             repo_id="local/lan_insertion_s29_v21",
-            default_prompt="Unplug the cable from the current port, then insert it into the blue port",
+            default_prompt="Unplug two cables from the current port, then insert them into the blue port",
             use_delta_joint_actions=True,
             state_dim=8,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=7_000,
+        num_train_steps=4_000,
+        save_interval=2_000,
+        keep_period=2_000,
         batch_size=128,
-        fsdp_devices=8,
-        num_workers=8,
+        fsdp_devices=4,
+        num_workers=32,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
@@ -1720,7 +1746,7 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotFrankaDataConfig(
             repo_id="local/lan_insertion_s29_v21",
-            default_prompt="Unplug the cable from the current port, then insert it into the blue port",
+            default_prompt="Unplug two cables from the current port, then insert them into the blue port",
             use_delta_joint_actions=True,
             state_dim=8,
             wrist_camera_only=True,
@@ -1730,8 +1756,84 @@ _CONFIGS = [
         save_interval=2_000,
         keep_period=2_000,
         batch_size=128,
-        fsdp_devices=8,
-        num_workers=8,
+        fsdp_devices=4,
+        num_workers=32,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # Double-cable insertion (left arm), 8-D state. New task, same recording
+    # stack and s29 schema as lan_insertion (49 SUCCESS episodes, 30 Hz,
+    # target_pose actions; the extra arm0_states_ext.npz Bota wrench is unused).
+    # Converted by scripts/convert_franka_raw_to_lerobot.py.
+    # NOTE: this dataset's raw ee_pose quats sign-flip mid-episode and disagree
+    # with target_pose hemispheres (qw~0 throughout); the converter's
+    # continuity-fix + hemisphere alignment handles it — see viz/ episode figure.
+    TrainConfig(
+        name="pi05_franka_double_cable_left_s8",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotFrankaDataConfig(
+            repo_id="local/double_cable_insert_left_s29_v21",
+            default_prompt="Unplug two cables from the current port, then insert them into the blue port",
+            use_delta_joint_actions=True,
+            state_dim=8,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=4_000,
+        save_interval=2_000,
+        keep_period=2_000,
+        batch_size=128,
+        fsdp_devices=4,
+        num_workers=32,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # Relative-EEF (rot6d) variant: 10-D action AND state [xyz, rot6d, gripper]
+    # (RLinf-style), DeltaActions(9,-1) -> xyz+rot6d relative-to-state, gripper
+    # absolute. rot6d is quat-sign-invariant, so this rep needs no quaternion
+    # canonicalization. Curated 36-episode subset (scratchpad double_cable_36eps.txt)
+    # converted with --rep rot6d10 --episode-list.
+    TrainConfig(
+        name="pi05_franka_double_cable_left_r6",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotFrankaDataConfig(
+            repo_id="local/double_cable_insert_left_r6_v21",
+            # Wrist-view scene: two black routers; both blue cables move from the
+            # right router into the left router (hence ..._insert_left).
+            default_prompt="Unplug the two cables from the right router, then insert them into the left router",
+            use_delta_joint_actions=True,
+            state_dim=10,
+            action_representation="rot6d10",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=4_000,
+        save_interval=1_000,
+        keep_period=1_000,
+        batch_size=64,
+        fsdp_devices=4,
+        num_workers=32,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # Wrist-only variant of the double-cable config: camera0 (wrist) only, side
+    # camera zeroed + masked. Same dataset and state/action chain as
+    # pi05_franka_double_cable_left_s8 -> norm-stats copied, not recomputed.
+    TrainConfig(
+        name="pi05_franka_double_cable_left_s8_wrist",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotFrankaDataConfig(
+            repo_id="local/double_cable_insert_left_s29_v21",
+            default_prompt="Unplug two cables from the current port, then insert them into the blue port",
+            use_delta_joint_actions=True,
+            state_dim=8,
+            wrist_camera_only=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=4_000,
+        save_interval=2_000,
+        keep_period=2_000,
+        batch_size=128,
+        fsdp_devices=4,
+        num_workers=32,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),

@@ -112,13 +112,17 @@ class FrankaInputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class FrankaOutputs(transforms.DataTransformFn):
-    """Outputs transform: slice the model's padded action back to the Franka 8-D.
+    """Outputs transform: slice the model's padded action back to the Franka dim.
 
-    Returns [qw, qx, qy, qz, x, y, z, gripper] — an absolute EE target pose the robot
-    can send straight to the impedance controller / IK. Renormalize the quaternion to
-    unit length on the robot side before use.
+    quat8 (action_dim=8): [qw, qx, qy, qz, x, y, z, gripper] — absolute EE pose;
+    renormalize the quaternion to unit length on the robot side before use.
+    rot6d10 (action_dim=10): [x, y, z, r6_0..r6_5, gripper] — recover the rotation
+    by Gram-Schmidt on the two 3-vectors on the robot side.
     """
 
+    # 8 for the quat8 representation, 10 for rot6d10.
+    action_dim: int = FRANKA_ACTION_DIM
+
     def __call__(self, data: dict) -> dict:
-        # Return the first 8 action dims ([quat, xyz, gripper]); the rest is padding.
-        return {"actions": np.asarray(data["actions"][:, :FRANKA_ACTION_DIM])}
+        # Return the first action_dim dims; the rest is padding.
+        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}

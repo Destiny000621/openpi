@@ -51,8 +51,8 @@ uv run python scripts/convert_v3_to_v21.py \
   --dst=$HOME/.cache/huggingface/lerobot/local/<dataset>_v21
 
 uv run python scripts/convert_v3_to_v21.py \
-  --src=/mnt/localssd/Sichang/lerobot_home/Sichang0621/vials_4_30fps_180 \
-  --dst=/mnt/localssd/Sichang/lerobot_home/local/vials_4_30fps_180_v21
+  --src=/mnt/localssd/Sichang/lerobot_home/local/vial_correction \
+  --dst=/mnt/localssd/Sichang/lerobot_home/local/vial_correction_v21
 
 ```
 
@@ -155,8 +155,8 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false \
     --exp-name=v1 \
     --resume=false
 
-XLA_PYTHON_CLIENT_PREALLOCATE=false \
-  uv run python scripts/train.py pi05_yam_vial_4_30fps --exp-name=v1 --no-resume
+CUDA_VISIBLE_DEVICES=4,5,6,7 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+  uv run python scripts/train.py pi05_yam_abc_sort_legos --exp-name=v1
 ```
 
 If a GPU is in use by another user, set `CUDA_VISIBLE_DEVICES=0,1,3,4,5,6,7`

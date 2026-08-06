@@ -6,7 +6,18 @@ stack); only the gripper column carries signal. The real arm command lives in
 ``target_pose`` (absolute EE target pose, stamped by the runner in both Cartesian
 and joint-IK mode).
 
-Representation:
+Two representations, selected by --rep:
+
+--rep rot6d10 (default; RLinf-style relative-EEF training):
+    action (10-D) = [ x, y, z, r6_0..r6_5, gripper ]   from target_pose + gripper target
+    state  (10-D) = [ x, y, z, r6_0..r6_5, gripper ]   from ee_pose + gripper state
+    r6 = first two columns of the rotation matrix (Zhou et al. 6D), concatenated
+    [c0x,c0y,c0z, c1x,c1y,c1z]. Rotation-sign-invariant (R(-q)=R(q)), so NO quat
+    canonicalization is needed in this mode. Train-time DeltaActions(mask=(9,-1))
+    makes xyz+rot6d relative-to-state; gripper stays absolute. Recover the
+    rotation at inference by Gram-Schmidt on the two 3-vectors.
+
+--rep quat8 (legacy; reproduces the _s29 datasets):
     action (8-D) = [ qw, qx, qy, qz, x, y, z,  gripper ]        target_pose + gripper target
     state (29-D) = [ qw, qx, qy, qz, x, y, z,  gripper,         ee_pose + gripper (dims 0-7)
                      j0..j6,                                    joint_pos arm columns (dims 8-14)
@@ -74,11 +85,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
+from scipy.spatial.transform import Rotation
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# Action layout; also the first 8 dims of the state (see module docstring).
+# quat8 layout; also the first 8 dims of the 29-D state (see module docstring).
 ACTION_NAMES = ["qw", "qx", "qy", "qz", "x", "y", "z", "gripper"]  # 8-D
 STATE_NAMES = [
     *ACTION_NAMES,                                                  # ee_pose + gripper (0-7)
@@ -86,6 +98,17 @@ STATE_NAMES = [
     *[f"j{i}_vel" for i in range(7)], "gripper_vel",                # joint_vel (15-22)
     "fx", "fy", "fz", "tx", "ty", "tz",                             # wrench (23-28)
 ]  # 29-D
+
+# rot6d10 layout; state and action share it exactly (see module docstring).
+ROT6D_NAMES = ["x", "y", "z", *[f"r6_{i}" for i in range(6)], "gripper"]  # 10-D
+
+
+def _pose7_to_xyz_rot6d(pose7: np.ndarray) -> np.ndarray:
+    """[qw,qx,qy,qz,x,y,z] (T,7) -> [x,y,z, rot6d(6)] (T,9). Sign-invariant."""
+    quat_xyzw = pose7[:, [1, 2, 3, 0]].astype(np.float64)  # scipy is scalar-last
+    rot = Rotation.from_quat(quat_xyzw).as_matrix()  # (T,3,3)
+    rot6d = np.concatenate([rot[:, :, 0], rot[:, :, 1]], axis=1)  # first two columns
+    return np.concatenate([pose7[:, 4:7], rot6d.astype(np.float32)], axis=1).astype(np.float32)
 
 
 def _continuity_fix(quat: np.ndarray) -> np.ndarray:
@@ -186,6 +209,14 @@ def main() -> None:
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--success-only", action="store_true", help="Only convert episodes with a SUCCESS marker.")
     ap.add_argument("--overwrite", action="store_true", help="Delete an existing dataset at the target first.")
+    ap.add_argument(
+        "--rep", choices=["rot6d10", "quat8"], default="rot6d10",
+        help="Action/state representation (see module docstring). Default rot6d10.",
+    )
+    ap.add_argument(
+        "--episode-list", type=Path, default=None,
+        help="Optional file with one episode dir (path or name) per line; only those are converted.",
+    )
     args = ap.parse_args()
 
     out_root = HF_LEROBOT_HOME / args.repo_id
@@ -195,17 +226,32 @@ def main() -> None:
         shutil.rmtree(out_root)
 
     episodes = _find_episodes(args.input_dir, args.success_only)
+    if args.episode_list is not None:
+        wanted = {Path(line.strip()).name for line in args.episode_list.read_text().splitlines() if line.strip()}
+        episodes = [ep for ep in episodes if ep.name in wanted]
+        missing = wanted - {ep.name for ep in episodes}
+        if missing:
+            raise FileNotFoundError(f"{len(missing)} episodes from --episode-list not found: {sorted(missing)[:5]} ...")
+        logger.info("episode-list: converting %d / %d listed episodes", len(episodes), len(wanted))
 
-    quat_ref = _compute_quat_reference(episodes)
-    logger.info("Quaternion reference (canonical hemisphere): %s", np.round(quat_ref, 4).tolist())
+    quat_ref = None
+    if args.rep == "quat8":  # rot6d is rotation-sign-invariant; no canonicalization needed
+        quat_ref = _compute_quat_reference(episodes)
+        logger.info("Quaternion reference (canonical hemisphere): %s", np.round(quat_ref, 4).tolist())
 
     probe = _read_video(episodes[0] / "camera0.mp4")[0]
     height, width = int(probe.shape[0]), int(probe.shape[1])
     logger.info("Camera resolution: %dx%d", height, width)
 
+    if args.rep == "rot6d10":
+        state_schema = {"dtype": "float32", "shape": (10,), "names": ROT6D_NAMES}
+        action_schema = {"dtype": "float32", "shape": (10,), "names": ROT6D_NAMES}
+    else:
+        state_schema = {"dtype": "float32", "shape": (29,), "names": STATE_NAMES}
+        action_schema = {"dtype": "float32", "shape": (8,), "names": ACTION_NAMES}
     features = {
-        "observation.state": {"dtype": "float32", "shape": (29,), "names": STATE_NAMES},
-        "action": {"dtype": "float32", "shape": (8,), "names": ACTION_NAMES},
+        "observation.state": state_schema,
+        "action": action_schema,
         "observation.images.camera0": {  # wrist
             "dtype": "video",
             "shape": (height, width, 3),
@@ -237,25 +283,35 @@ def main() -> None:
         ac = np.load(ep / "arm0_actions.npz")
         ee_pose = st["ee_pose"].astype(np.float32)
         target_pose = ac["target_pose"].astype(np.float32)
-        # One canonicalization decision per episode, shared by state and action.
-        state_quat, action_quat = _canonicalize_quats(ee_pose[:, :4], target_pose[:, :4], quat_ref)
-        # State (29-D): [quat, xyz, gripper | joint_pos arm | joint_vel | wrench].
-        state = np.concatenate(
-            [
-                state_quat.astype(np.float32),
-                ee_pose[:, 4:7],
-                _gripper(st, "gripper_pos", "joint_pos"),
-                st["joint_pos"].astype(np.float32)[:, :7],
-                st["joint_vel"].astype(np.float32),
-                st["wrench"].astype(np.float32),
-            ],
-            axis=1,
-        )
-        # Action (8-D): target_pose (canonicalized) + gripper action.
-        action = np.concatenate(
-            [action_quat.astype(np.float32), target_pose[:, 4:7], _gripper(ac, "gripper_target", "joint_targets")],
-            axis=1,
-        )
+        if args.rep == "rot6d10":
+            # State/action (10-D each): [xyz, rot6d, gripper]. rot6d is quat-sign
+            # invariant, so the raw (flip-ridden) quats are safe to use directly.
+            state = np.concatenate(
+                [_pose7_to_xyz_rot6d(ee_pose), _gripper(st, "gripper_pos", "joint_pos")], axis=1
+            )
+            action = np.concatenate(
+                [_pose7_to_xyz_rot6d(target_pose), _gripper(ac, "gripper_target", "joint_targets")], axis=1
+            )
+        else:
+            # One canonicalization decision per episode, shared by state and action.
+            state_quat, action_quat = _canonicalize_quats(ee_pose[:, :4], target_pose[:, :4], quat_ref)
+            # State (29-D): [quat, xyz, gripper | joint_pos arm | joint_vel | wrench].
+            state = np.concatenate(
+                [
+                    state_quat.astype(np.float32),
+                    ee_pose[:, 4:7],
+                    _gripper(st, "gripper_pos", "joint_pos"),
+                    st["joint_pos"].astype(np.float32)[:, :7],
+                    st["joint_vel"].astype(np.float32),
+                    st["wrench"].astype(np.float32),
+                ],
+                axis=1,
+            )
+            # Action (8-D): target_pose (canonicalized) + gripper action.
+            action = np.concatenate(
+                [action_quat.astype(np.float32), target_pose[:, 4:7], _gripper(ac, "gripper_target", "joint_targets")],
+                axis=1,
+            )
         cam0 = _read_video(ep / "camera0.mp4")  # wrist
         cam1 = _read_video(ep / "camera1.mp4")  # side
 
@@ -280,9 +336,13 @@ def main() -> None:
         total_frames += t
         logger.info("[%d/%d] %s -> %d frames (task=%r)", ep_idx + 1, len(episodes), ep.name, t, task)
 
-    # The deploy client needs the same hemisphere convention for its live ee_pose
-    # quats: flip the observed quat if dot(q, quat_reference) < 0.
-    (out_root / "quat_reference.json").write_text(json.dumps({"quat_reference_wxyz": quat_ref.tolist()}, indent=2))
+    if quat_ref is not None:
+        # The deploy client needs the same hemisphere convention for its live ee_pose
+        # quats: flip the observed quat if dot(q, quat_reference) < 0. (quat8 only —
+        # rot6d needs no convention.)
+        (out_root / "quat_reference.json").write_text(
+            json.dumps({"quat_reference_wxyz": quat_ref.tolist()}, indent=2)
+        )
     logger.info("Done. %d episodes / %d frames at %s", len(episodes), total_frames, out_root)
 
 
