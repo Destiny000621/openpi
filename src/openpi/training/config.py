@@ -410,21 +410,25 @@ class LeRobotFrankaDataConfig(DataConfigFactory):
     use_delta_joint_actions: bool = True
     # Injected into the input data when the "prompt" key is not present.
     default_prompt: str | None = None
-    # State prefix width fed to the model: 29 (full proprio, default) or 8
-    # (ee_pose + gripper only; dims 0-7 of the same dataset — controlled ablation
-    # of the extra proprio without reconverting).
-    state_dim: int = franka_policy.FRANKA_STATE_DIM
+    # State width fed to the model. rot6d10 (the standard): always 10.
+    # Legacy quat8 datasets: 29 (full proprio) or 8 (prefix slice) — a
+    # git-restored quat8 config must set this explicitly (29 for the old
+    # lan_insertion config, which relied on the former default).
+    state_dim: int = 10
     # If true, train on the wrist camera only: the side camera (base_0_rgb) is
     # zeroed + masked off; the wrist stays in left_wrist_0_rgb. Same dataset,
     # no reconversion — controlled ablation of the third-person view.
     wrist_camera_only: bool = False
     # Action/state representation the dataset was converted with:
-    #   "quat8":   action 8-D  [quat, xyz, gripper], delta mask (-4, 3, -1)
-    #              (xyz relative, quat + gripper absolute).
     #   "rot6d10": action 10-D [xyz, rot6d, gripper], delta mask (9, -1)
     #              (xyz + rot6d relative-to-state, gripper absolute; RLinf-style).
-    #              Pair with state_dim=10 and a *_r6_v21 dataset.
-    action_representation: Literal["quat8", "rot6d10"] = "quat8"
+    #              Pair with state_dim=10 and a *_r6_v21 dataset. THE standard.
+    #   "quat8":   LEGACY (all quat8 TrainConfigs were removed): action 8-D
+    #              [quat, xyz, gripper], delta mask (-4, 3, -1). Kept only so a
+    #              git-restored config can still serve an old quat8 checkpoint;
+    #              do not use for new Franka training — quaternion hemisphere
+    #              canonicalization proved fragile at qw~0.
+    action_representation: Literal["quat8", "rot6d10"] = "rot6d10"
     # rot6d10 only. If False (the standard going forward), the rot6d dims (3:9 of
     # both state and actions) BYPASS normalization: their stats are replaced at
     # load time with identity-mapping values (q01=-1, q99=+1; mean=0, std=1), so
@@ -1738,104 +1742,16 @@ _CONFIGS = [
     #
     # Fine-tuning single-arm Franka FR3 configs (see docs/franka_finetune.md).
     #
-    # 8-D EE-space actions [qw,qx,qy,qz, x,y,z, gripper] = target_pose + gripper;
-    # 29-D state = [quat, xyz, gripper | joint_pos arm | joint_vel | wrench].
-    # EE-space actions because the raw teleop never stamped arm joint_targets
-    # (dead columns). Absolute poses -> DeltaActions(make_bool_mask(-4, 3, -1)):
-    # xyz delta vs. state, quaternion + gripper absolute. No AssetsConfig:
-    # norm-stats computed fresh.
-    TrainConfig(
-        name="pi05_franka_lan_insertion",
-        model=pi0_config.Pi0Config(pi05=True),
-        data=LeRobotFrankaDataConfig(
-            repo_id="local/lan_insertion_s29_v21",
-            default_prompt="Unplug the cable from the current port, then insert it into the blue port",
-            use_delta_joint_actions=True,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=5_000,
-        batch_size=64,
-        fsdp_devices=8,
-        num_workers=8,
-        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
-        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
-    ),
-    # s8 ablation: identical to pi05_franka_lan_insertion except the state fed to
-    # the model is only dims 0-7 of the same s29 dataset — [qw,qx,qy,qz, x,y,z,
-    # gripper] (ee_pose + gripper), no joint_pos/joint_vel/wrench proprio.
-    # Same episodes, same actions, same transforms; only the state input differs,
-    # so a head-to-head run isolates the value of the extra proprio. Norm-stats
-    # are per-config (keyed by config name), so the 8-D stats live separately.
-    TrainConfig(
-        name="pi05_franka_lan_insertion_s8",
-        model=pi0_config.Pi0Config(pi05=True),
-        data=LeRobotFrankaDataConfig(
-            repo_id="local/lan_insertion_s29_v21",
-            default_prompt="Unplug two cables from the current port, then insert them into the blue port",
-            use_delta_joint_actions=True,
-            state_dim=8,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=4_000,
-        save_interval=2_000,
-        keep_period=2_000,
-        batch_size=128,
-        fsdp_devices=4,
-        num_workers=32,
-        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
-        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
-    ),
-    # Wrist-only + 8-D-state ablation: the model sees only the wrist camera
-    # (side camera / base_0_rgb zeroed + masked off) and only state dims 0-7
-    # ([quat, xyz, gripper] — same lean state as _s8). Same s29 dataset, no
-    # reconversion. 4k steps; checkpoints land at 2000 and 3999 (final) —
-    # save_interval=2k, keep_period=2k so the 2k checkpoint survives pruning.
-    TrainConfig(
-        name="pi05_franka_lan_insertion_s8_wrist",
-        model=pi0_config.Pi0Config(pi05=True),
-        data=LeRobotFrankaDataConfig(
-            repo_id="local/lan_insertion_s29_v21",
-            default_prompt="Unplug two cables from the current port, then insert them into the blue port",
-            use_delta_joint_actions=True,
-            state_dim=8,
-            wrist_camera_only=True,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=4_000,
-        save_interval=2_000,
-        keep_period=2_000,
-        batch_size=128,
-        fsdp_devices=4,
-        num_workers=32,
-        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
-        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
-    ),
-    # Double-cable insertion (left arm), 8-D state. New task, same recording
-    # stack and s29 schema as lan_insertion (49 SUCCESS episodes, 30 Hz,
-    # target_pose actions; the extra arm0_states_ext.npz Bota wrench is unused).
-    # Converted by scripts/convert_franka_raw_to_lerobot.py.
-    # NOTE: this dataset's raw ee_pose quats sign-flip mid-episode and disagree
-    # with target_pose hemispheres (qw~0 throughout); the converter's
-    # continuity-fix + hemisphere alignment handles it — see viz/ episode figure.
-    TrainConfig(
-        name="pi05_franka_double_cable_left_s8",
-        model=pi0_config.Pi0Config(pi05=True),
-        data=LeRobotFrankaDataConfig(
-            repo_id="local/double_cable_insert_left_s29_v21",
-            default_prompt="Unplug two cables from the current port, then insert them into the blue port",
-            use_delta_joint_actions=True,
-            state_dim=8,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=4_000,
-        save_interval=2_000,
-        keep_period=2_000,
-        batch_size=128,
-        fsdp_devices=4,
-        num_workers=32,
-        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
-        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
-    ),
+    # Standard representation: rot6d10 — 10-D state AND action
+    # [x,y,z, rot6d(6), gripper] from ee_pose/target_pose (EE-space because the
+    # raw teleop never stamped arm joint_targets). DeltaActions(9,-1): xyz+rot6d
+    # relative-to-state, gripper absolute. rot6d is quat-sign-invariant, so no
+    # quaternion canonicalization exists anywhere in this path.
+    # The legacy quat8 configs (pi05_franka_lan_insertion{,_s8,_s8_wrist},
+    # pi05_franka_double_cable_left_s8{,_wrist}) were removed — quaternion
+    # canonicalization proved fragile (qw~0 hemisphere splits). Their trained
+    # checkpoints remain on disk; to serve one, restore its config from git
+    # history (commit a7c3a4e or earlier).
     # Relative-EEF (rot6d) variant: 10-D action AND state [xyz, rot6d, gripper]
     # (RLinf-style), DeltaActions(9,-1) -> xyz+rot6d relative-to-state, gripper
     # absolute. rot6d is quat-sign-invariant, so this rep needs no quaternion
@@ -1888,29 +1804,6 @@ _CONFIGS = [
         save_interval=1_000,
         keep_period=1_000,
         batch_size=64,
-        fsdp_devices=4,
-        num_workers=32,
-        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
-        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
-    ),
-    # Wrist-only variant of the double-cable config: camera0 (wrist) only, side
-    # camera zeroed + masked. Same dataset and state/action chain as
-    # pi05_franka_double_cable_left_s8 -> norm-stats copied, not recomputed.
-    TrainConfig(
-        name="pi05_franka_double_cable_left_s8_wrist",
-        model=pi0_config.Pi0Config(pi05=True),
-        data=LeRobotFrankaDataConfig(
-            repo_id="local/double_cable_insert_left_s29_v21",
-            default_prompt="Unplug two cables from the current port, then insert them into the blue port",
-            use_delta_joint_actions=True,
-            state_dim=8,
-            wrist_camera_only=True,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=4_000,
-        save_interval=2_000,
-        keep_period=2_000,
-        batch_size=128,
         fsdp_devices=4,
         num_workers=32,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
