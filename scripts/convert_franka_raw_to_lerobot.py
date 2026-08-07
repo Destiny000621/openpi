@@ -214,6 +214,11 @@ def main() -> None:
         help="Action/state representation (see module docstring). Default rot6d10.",
     )
     ap.add_argument(
+        "--include-joints", action="store_true",
+        help="rot6d10 only: append the 7 arm joint_pos columns to the state "
+        "(17-D state [xyz, rot6d, gripper, j0..j6]; action stays 10-D).",
+    )
+    ap.add_argument(
         "--episode-list", type=Path, default=None,
         help="Optional file with one episode dir (path or name) per line; only those are converted.",
     )
@@ -243,8 +248,11 @@ def main() -> None:
     height, width = int(probe.shape[0]), int(probe.shape[1])
     logger.info("Camera resolution: %dx%d", height, width)
 
+    if args.include_joints and args.rep != "rot6d10":
+        raise SystemExit("--include-joints is only supported with --rep rot6d10")
     if args.rep == "rot6d10":
-        state_schema = {"dtype": "float32", "shape": (10,), "names": ROT6D_NAMES}
+        state_names = ROT6D_NAMES + ([f"j{i}" for i in range(7)] if args.include_joints else [])
+        state_schema = {"dtype": "float32", "shape": (len(state_names),), "names": state_names}
         action_schema = {"dtype": "float32", "shape": (10,), "names": ROT6D_NAMES}
     else:
         state_schema = {"dtype": "float32", "shape": (29,), "names": STATE_NAMES}
@@ -286,9 +294,10 @@ def main() -> None:
         if args.rep == "rot6d10":
             # State/action (10-D each): [xyz, rot6d, gripper]. rot6d is quat-sign
             # invariant, so the raw (flip-ridden) quats are safe to use directly.
-            state = np.concatenate(
-                [_pose7_to_xyz_rot6d(ee_pose), _gripper(st, "gripper_pos", "joint_pos")], axis=1
-            )
+            state_parts = [_pose7_to_xyz_rot6d(ee_pose), _gripper(st, "gripper_pos", "joint_pos")]
+            if args.include_joints:
+                state_parts.append(st["joint_pos"].astype(np.float32)[:, :7])
+            state = np.concatenate(state_parts, axis=1)
             action = np.concatenate(
                 [_pose7_to_xyz_rot6d(target_pose), _gripper(ac, "gripper_target", "joint_targets")], axis=1
             )

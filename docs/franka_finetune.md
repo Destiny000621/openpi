@@ -179,6 +179,14 @@ other's config name (their stats conventions differ).
 
 Other knobs on `LeRobotFrankaDataConfig`:
 
+- `state_dim=17` + a dataset converted with `--include-joints` — appends the 7
+  arm `joint_pos` columns *behind* the pose prefix
+  (`[xyz, rot6d, gripper, j0..j6]`), so `DeltaActions` still lines up and the
+  action stays 10-D; joints are proprio conditioning only. Joints get quantile
+  normalization; rot6d stays raw. Config:
+  `pi05_franka_double_cable_left_r6_rawrot_joint` (dataset
+  `local/double_cable_insert_left_r6j_v21`). A 17-D-state checkpoint needs the
+  client to send the 17-D state (append live `joint_pos[:7]`).
 - `wrist_camera_only=True` — zero + mask the side camera (`base_0_rgb`); the
   wrist stays in `left_wrist_0_rgb`. Camera ablations need no reconversion, and
   norm-stats are image-independent (copy, never recompute, for camera-only

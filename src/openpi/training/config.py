@@ -360,16 +360,17 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 def _identity_rot6d_norm_stats(
     norm_stats: dict[str, _transforms.NormStats],
 ) -> dict[str, _transforms.NormStats]:
-    """Replace the rot6d dims (3:9) of 10-D state/actions stats with identity-mapping values.
+    """Replace the rot6d dims (3:9) of rot6d-layout state/actions stats with identity values.
 
     q01=-1, q99=+1 makes quantile normalization (x - q01) / (q99 - q01) * 2 - 1 the
     identity on those dims (up to the 1e-6 eps); mean=0, std=1 does the same for
-    z-score. Other dims keep their computed stats. Keys that are not 10-D
-    state/actions vectors pass through untouched.
+    z-score. Other dims keep their computed stats. Applies to 10-D actions and
+    10-D or 17-D (joints-appended) states; anything else passes through untouched.
     """
+    widths = {"actions": (10,), "state": (10, 17)}
     out: dict[str, _transforms.NormStats] = {}
     for key, stats in norm_stats.items():
-        if key not in ("state", "actions") or stats.mean.shape[-1] != 10:
+        if key not in widths or stats.mean.shape[-1] not in widths[key]:
             out[key] = stats
             continue
         mean, std = stats.mean.copy(), stats.std.copy()
@@ -410,7 +411,9 @@ class LeRobotFrankaDataConfig(DataConfigFactory):
     use_delta_joint_actions: bool = True
     # Injected into the input data when the "prompt" key is not present.
     default_prompt: str | None = None
-    # State width fed to the model. rot6d10 (the standard): always 10.
+    # State width fed to the model. rot6d10: 10 (standard) or 17 when the dataset
+    # was converted with --include-joints ([xyz, rot6d, gripper, j0..j6] — the
+    # joints ride BEHIND the pose prefix so DeltaActions still lines up).
     # Legacy quat8 datasets: 29 (full proprio) or 8 (prefix slice) — a
     # git-restored quat8 config must set this explicitly (29 for the old
     # lan_insertion config, which relied on the former default).
@@ -1796,6 +1799,31 @@ _CONFIGS = [
             default_prompt="Unplug the two cables from the right router, then insert them into the left router",
             use_delta_joint_actions=True,
             state_dim=10,
+            action_representation="rot6d10",
+            normalize_rot6d=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=4_000,
+        save_interval=1_000,
+        keep_period=1_000,
+        batch_size=64,
+        fsdp_devices=4,
+        num_workers=32,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # Joints-in-state variant: identical to _r6_rawrot except the state carries
+    # the 7 arm joint positions appended behind the pose prefix — 17-D
+    # [xyz, rot6d, gripper, j0..j6] (dataset converted with --include-joints).
+    # Actions unchanged (10-D); joints are proprio conditioning only.
+    TrainConfig(
+        name="pi05_franka_double_cable_left_r6_rawrot_joint",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotFrankaDataConfig(
+            repo_id="local/double_cable_insert_left_r6j_v21",
+            default_prompt="Unplug the two cables from the right router, then insert them into the left router",
+            use_delta_joint_actions=True,
+            state_dim=17,
             action_representation="rot6d10",
             normalize_rot6d=False,
         ),
