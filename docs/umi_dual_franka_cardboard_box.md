@@ -19,6 +19,8 @@ representation and a controlled absolute-action baseline.
 > as an ablation: their chunks stay inside a source episode but can cross from
 > one physical box instance into the next.
 
+https://claude.ai/code/artifact/2a439908-c048-4e95-afe6-3101e53fc34b?via=auto_preview
+
 ## Registered configs
 
 | Episode path | Purpose | Config | Dataset repo |
