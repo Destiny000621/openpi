@@ -1616,6 +1616,30 @@ _CONFIGS = [
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
+    # Stack-cubes task, same cross-embodiment recipe as the cardboard-box
+    # gripper-only config: 2-D gripper state, fixed-anchor relative action20,
+    # 224 px crop. The derived x264 copy is downscaled 1920->384 to match the
+    # cardboard exports' preprocessing, keeping crop semantics identical.
+    # rot6d action dims run raw via the neutralized stats file.
+    TrainConfig(
+        name="pi05_umi_dual_franka_stack_cubes_relative_gripper_only",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotUmiDualFrankaDataConfig(
+            repo_id="local/stack_cubes_tcp_x264",
+            default_prompt="Stack the cubes into a tower",
+            action_representation="relative",
+            state_mode="gripper_only",
+            image_crop=224,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10000,
+        batch_size=128,
+        fsdp_devices=8,
+        num_workers=8,
+        save_interval=5_000,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
     # Cross-embodiment variant with cropped views: same as the gripper-only
     # config below, plus a centered 272 px crop of both 384 px fisheye views
     # (largest square inscribed in the fisheye circle) applied in the shared

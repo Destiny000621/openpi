@@ -293,3 +293,34 @@ def test_vid7to54_gripper_only_config_matches_10s_recipe(monkeypatch, tmp_path):
     assert isinstance(
         data_config.data_transforms.outputs[0], umi_dual_franka_policy.UmiDualFrankaRelativeGripperOnlyOutputs
     )
+
+
+def test_stack_cubes_gripper_only_config_contract(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        _config.DataConfigFactory,
+        "_load_norm_stats",
+        lambda self, assets_dir, asset_id: None,
+    )
+    monkeypatch.setattr(
+        _config.ModelTransformFactory,
+        "__call__",
+        lambda self, model_config: transforms.Group(),
+    )
+
+    train_config = _config.get_config("pi05_umi_dual_franka_stack_cubes_relative_gripper_only")
+    assert train_config.data.repo_id == "local/stack_cubes_tcp_x264"
+    assert train_config.data.default_prompt == "Stack the cubes into a tower"
+    assert train_config.data.state_mode == "gripper_only"
+    assert train_config.data.image_crop == 224
+    assert train_config.batch_size == 128
+    assert train_config.fsdp_devices == 8
+    assert train_config.num_train_steps == 10_000
+
+    data_config = train_config.data.create(tmp_path, train_config.model)
+    inputs = data_config.data_transforms.inputs[0]
+    assert isinstance(inputs, umi_dual_franka_policy.UmiDualFrankaRelativeInputs)
+    assert inputs.state_mode == "gripper_only"
+    assert inputs.image_crop == 224
+    assert isinstance(
+        data_config.data_transforms.outputs[0], umi_dual_franka_policy.UmiDualFrankaRelativeGripperOnlyOutputs
+    )
