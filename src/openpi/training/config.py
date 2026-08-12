@@ -1503,18 +1503,17 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        # Extended 15k -> 18k steps (resume run, 2026-08-05): fine-tune from the
-        # existing 14999 checkpoint on cuda:0,1,2,3 (4 GPUs, once freed from another
-        # job) instead of the original 8. fsdp_devices matches visible device count;
-        # batch_size kept at the original global 64 (now 16/device, plenty of headroom
-        # on H200) for continuity with the run being resumed. save_interval dropped to
-        # 1k (vs. the original 5k) so a repeat of the external-SIGKILL incident loses
-        # at most ~1k steps instead of the whole 3k extension.
+        # Extended 15k -> 18k steps: TRUE resume from the 14999 checkpoint.
+        # fsdp_devices MUST stay 8: the checkpoint was saved on an 8-device mesh and
+        # stock openpi's resume path relies on orbax's saved-sharding fallback, which
+        # requires the same device topology (resuming with 4 visible GPUs fails with
+        # "sharding passed to deserialization ... Got None"). Defaults give
+        # save_interval=1000, keep_period=5000 — note 14999 is NOT a keep_period
+        # multiple, so it is GC'd after the first new save (backup kept at
+        # v1_14999_backup/).
         num_train_steps=18_000,
-        save_interval=1_000,
-        keep_period=5_000,
         batch_size=64,
-        fsdp_devices=4,
+        fsdp_devices=8,
         num_workers=8,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
@@ -1547,9 +1546,7 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=15_000,
-        save_interval=5_000,
-        keep_period=5_000,
+        num_train_steps=23_000,
         batch_size=64,
         fsdp_devices=8,
         num_workers=8,
@@ -1586,9 +1583,7 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=15_000,
-        save_interval=5_000,
-        keep_period=5_000,
+        num_train_steps=18_000,
         batch_size=128,
         fsdp_devices=4,
         num_workers=32,
@@ -1803,11 +1798,36 @@ _CONFIGS = [
             normalize_rot6d=False,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=4_000,
-        save_interval=1_000,
-        keep_period=1_000,
-        batch_size=64,
-        fsdp_devices=4,
+        num_train_steps=6_000,
+        save_interval=2_000,
+        keep_period=2_000,
+        batch_size=128,
+        fsdp_devices=8,
+        num_workers=32,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # Same recipe as _r6_rawrot on the larger double_cable_100 recording set
+    # (99 SUCCESS of 100 episodes, ~114k frames — vs 36 curated episodes/53k).
+    # Same task and prompt; the routers sit further apart (grasp->release moves
+    # ~21 cm laterally vs ~3 cm), so it is a distinct dataset, not a superset.
+    TrainConfig(
+        name="pi05_franka_double_cable_100_r6_rawrot",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotFrankaDataConfig(
+            repo_id="local/double_cable_100_r6_v21",
+            default_prompt="Unplug the two cables from the right router, then insert them into the left router",
+            use_delta_joint_actions=True,
+            state_dim=10,
+            action_representation="rot6d10",
+            normalize_rot6d=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=6_000,
+        save_interval=2_000,
+        keep_period=2_000,
+        batch_size=128,
+        fsdp_devices=8,
         num_workers=32,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
