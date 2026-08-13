@@ -388,3 +388,117 @@ def test_neutralize_rot6d_action_norm_stats_passes_rot6d_through_quantile_norm()
     assert not np.allclose(normalized["actions"][other], sample["actions"][other])
     restored = transforms.Unnormalize(patched, use_quantiles=True)(normalized)
     np.testing.assert_allclose(restored["actions"], sample["actions"], atol=1e-5)
+
+
+def _history_record(states: np.ndarray, actions: np.ndarray | None = None) -> dict:
+    record = _input_record(states[-1], actions)
+    record["observation/state"] = states
+    return record
+
+
+def test_relative_history_state_encodes_previous_frame_in_current_tcp_frame() -> None:
+    history = _raw_pose(
+        left_position=(0.40, -0.20, 0.30),
+        left_quaternion=_quat_z(90.0),
+        left_gripper=0.20,
+        right_position=(-0.30, 0.50, 0.10),
+        right_quaternion=_quat_z(-35.0),
+        right_gripper=0.80,
+    )
+    current = _raw_pose(
+        left_position=(0.41, -0.19, 0.31),
+        left_quaternion=_quat_z(95.0),
+        left_gripper=0.55,
+        right_position=(-0.28, 0.49, 0.12),
+        right_quaternion=_quat_z(-30.0),
+        right_gripper=0.15,
+    )
+    window = np.stack((history, current))
+
+    state = policy.raw16_history_to_relative_state20(window)
+
+    assert state.shape == (policy.MODEL_STATE_DIM,)
+    # Grippers are the CURRENT absolute values, never the history ones.
+    np.testing.assert_allclose(state[9], current[7])
+    np.testing.assert_allclose(state[19], current[15])
+    # Pose block equals inverse(T_current) @ T_history, i.e. composing it back
+    # with the current pose reproduces the history pose (grippers stay current).
+    expected = history.copy()
+    expected[[7, 15]] = current[[7, 15]]
+    recomposed = policy.relative20_actions_to_raw16(policy.raw16_to_absolute20(current), state)
+    _assert_same_raw_poses(recomposed, expected)
+
+
+def test_relative_history_state_is_identity_without_motion_and_for_single_frame() -> None:
+    pose = _raw_pose(
+        left_position=(0.1, 0.2, 0.3),
+        left_quaternion=_quat_z(40.0),
+        left_gripper=0.3,
+        right_position=(-0.1, 0.4, 0.2),
+        right_quaternion=_quat_z(-70.0),
+        right_gripper=0.7,
+    )
+    identity_block = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+
+    stalled = policy.raw16_history_to_relative_state20(np.stack((pose, pose)))
+    single = policy.raw16_history_to_relative_state20(pose)
+
+    for state in (stalled, single):
+        np.testing.assert_allclose(state[0:9], identity_block, atol=1e-6)
+        np.testing.assert_allclose(state[10:19], identity_block, atol=1e-6)
+        np.testing.assert_allclose(state[[9, 19]], pose[[7, 15]])
+
+
+def test_relative_history_inputs_anchor_actions_on_the_current_frame() -> None:
+    history = _raw_pose(left_position=(0.30, -0.10, 0.20), left_quaternion=_quat_z(10.0), left_gripper=0.1)
+    current, actions = _sample_state_and_actions()
+    window = np.stack((history, current))
+
+    result = policy.UmiDualFrankaRelativeInputs(
+        model_type=_model.ModelType.PI05, state_mode="relative_history"
+    )(_history_record(window, actions))
+
+    assert result["state"].shape == (policy.MODEL_STATE_DIM,)
+    assert result["actions"].shape == (2, policy.MODEL_STATE_DIM)
+    # The action chunk must be anchored on the CURRENT frame, never the history
+    # frame: decoding against the current pose reproduces the raw targets.
+    _assert_same_raw_poses(
+        policy.relative20_actions_to_raw16(policy.raw16_to_absolute20(current), result["actions"]), actions
+    )
+    np.testing.assert_allclose(result["state"], policy.raw16_history_to_relative_state20(window))
+
+
+def test_relative_history_batches_and_rejects_bad_windows() -> None:
+    history, current = _raw_pose(left_gripper=0.2), _raw_pose(left_position=(0.01, 0.0, 0.0), left_gripper=0.9)
+    batch = np.stack((np.stack((history, current)), np.stack((current, history))))
+
+    batched = policy.raw16_history_to_relative_state20(batch)
+    assert batched.shape == (2, policy.MODEL_STATE_DIM)
+    np.testing.assert_allclose(batched[0], policy.raw16_history_to_relative_state20(batch[0]))
+
+    with pytest.raises(ValueError, match="state history"):
+        policy.raw16_history_to_relative_state20(np.zeros((2, 15)))
+
+
+def test_neutralize_covers_state_when_requested() -> None:
+    import openpi.shared.normalize as normalize
+
+    base = np.linspace(0.1, 2.0, 20)
+    stats = {
+        "state": normalize.NormStats(mean=base.copy(), std=base + 1, q01=base - 0.5, q99=base + 0.5),
+        "actions": normalize.NormStats(mean=base.copy(), std=base + 1, q01=base - 0.5, q99=base + 0.5),
+    }
+    rot = list(policy.ROT6D_ACTION_DIMS)
+    other = [i for i in range(20) if i not in rot]
+
+    both = policy.neutralize_rot6d_norm_stats(stats, keys=("actions", "state"))
+    for key in ("actions", "state"):
+        np.testing.assert_allclose(np.asarray(both[key].q01)[rot], -1.0)
+        np.testing.assert_allclose(np.asarray(both[key].q99)[rot], 1.0)
+        np.testing.assert_allclose(np.asarray(both[key].q01)[other], (base - 0.5)[other])
+
+    # Default keeps state untouched, and a 2-D gripper-only state is skipped.
+    actions_only = policy.neutralize_rot6d_norm_stats(stats)
+    np.testing.assert_allclose(np.asarray(actions_only["state"].q01), base - 0.5)
+    small = {"state": normalize.NormStats(mean=np.zeros(2), std=np.ones(2), q01=-np.ones(2), q99=np.ones(2))}
+    np.testing.assert_allclose(np.asarray(policy.neutralize_rot6d_norm_stats(small, keys=("state",))["state"].q01), -1.0)

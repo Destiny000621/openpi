@@ -324,3 +324,63 @@ def test_stack_cubes_gripper_only_config_contract(monkeypatch, tmp_path):
     assert isinstance(
         data_config.data_transforms.outputs[0], umi_dual_franka_policy.UmiDualFrankaRelativeGripperOnlyOutputs
     )
+
+
+def test_relative_history_config_contract_and_observation_window(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        _config.DataConfigFactory,
+        "_load_norm_stats",
+        lambda self, assets_dir, asset_id: None,
+    )
+    monkeypatch.setattr(
+        _config.ModelTransformFactory,
+        "__call__",
+        lambda self, model_config: transforms.Group(),
+    )
+
+    train_config = _config.get_config("pi05_umi_dual_franka_stack_cubes_relative_history")
+    assert train_config.data.state_mode == "relative_history"
+    assert train_config.data.observation_horizon == 2
+    assert train_config.data.image_crop == 224
+    assert train_config.data.repo_id == "local/stack_cubes_tcp_x264"
+
+    data_config = train_config.data.create(tmp_path, train_config.model)
+    inputs = data_config.data_transforms.inputs[0]
+    assert isinstance(inputs, umi_dual_franka_policy.UmiDualFrankaRelativeInputs)
+    assert inputs.state_mode == "relative_history"
+    # A pose-free state means the server cannot compose: it must serve relative chunks.
+    assert isinstance(
+        data_config.data_transforms.outputs[0], umi_dual_franka_policy.UmiDualFrankaRelativeGripperOnlyOutputs
+    )
+    assert data_config.state_sequence_keys == ("observation.state",)
+    assert data_config.observation_horizon == 2
+
+    # The loader must request one past frame plus the current one, oldest first.
+    captured = {}
+    sentinel = object()
+
+    class Metadata:
+        fps = 30.0
+
+    def fake_dataset(repo_id, *, delta_timestamps):
+        captured["delta_timestamps"] = delta_timestamps
+        return sentinel
+
+    monkeypatch.setattr(_data_loader.lerobot_dataset, "LeRobotDatasetMetadata", lambda repo_id: Metadata())
+    monkeypatch.setattr(_data_loader.lerobot_dataset, "LeRobotDataset", fake_dataset)
+    _data_loader.create_torch_dataset(data_config, action_horizon=50, model_config=train_config.model)
+    np.testing.assert_allclose(captured["delta_timestamps"]["observation.state"], [-1 / 30.0, 0.0])
+    assert len(captured["delta_timestamps"]["action"]) == 50
+
+
+def test_relative_history_requires_observation_horizon_at_least_two(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        _config.DataConfigFactory,
+        "_load_norm_stats",
+        lambda self, assets_dir, asset_id: None,
+    )
+    factory = _config.LeRobotUmiDualFrankaDataConfig(
+        repo_id=_LOGICAL_REPO_ID, state_mode="relative_history", observation_horizon=1
+    )
+    with pytest.raises(ValueError, match="observation_horizon"):
+        factory.create(tmp_path, _config.pi0_config.Pi0Config(pi05=True, action_horizon=50))

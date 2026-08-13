@@ -89,6 +89,15 @@ class DataConfig:
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
 
+    # Names of observation keys whose recent history the data loader should load,
+    # using negative delta timestamps so each sample carries `observation_horizon`
+    # frames oldest-first (the last one is the current frame). Empty means the
+    # loader requests only the current frame.
+    state_sequence_keys: Sequence[str] = ()
+    # Number of observation frames per sample, including the current one. 1 keeps
+    # the stock single-frame behavior.
+    observation_horizon: int = 1
+
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
@@ -463,7 +472,10 @@ class LeRobotUmiDualFrankaDataConfig(DataConfigFactory):
     """
 
     action_representation: Literal["relative", "absolute"] = "relative"
-    state_mode: Literal["full", "gripper_only"] = "full"
+    state_mode: Literal["full", "gripper_only", "relative_history"] = "full"
+    # Observation frames per sample for state_mode="relative_history" (>= 2:
+    # 2 means one history frame plus the current one).
+    observation_horizon: int = 1
     # Optional centered square crop (pixel side length) applied to both camera
     # views in the shared input transform, before the model resize.
     image_crop: int | None = None
@@ -485,8 +497,15 @@ class LeRobotUmiDualFrankaDataConfig(DataConfigFactory):
             ]
         )
 
-        if self.state_mode not in ("full", "gripper_only"):
-            raise ValueError(f"state_mode must be either 'full' or 'gripper_only', got {self.state_mode!r}")
+        if self.state_mode not in umi_dual_franka_policy.STATE_MODES:
+            raise ValueError(
+                f"state_mode must be one of {umi_dual_franka_policy.STATE_MODES}, got {self.state_mode!r}"
+            )
+        if self.state_mode == "relative_history" and self.observation_horizon < 2:
+            raise ValueError(
+                "state_mode='relative_history' needs observation_horizon >= 2; "
+                f"got {self.observation_horizon}. One frame carries no history."
+            )
 
         match self.action_representation:
             case "relative":
@@ -499,15 +518,15 @@ class LeRobotUmiDualFrankaDataConfig(DataConfigFactory):
                         )
                     ],
                     outputs=[
-                        umi_dual_franka_policy.UmiDualFrankaRelativeGripperOnlyOutputs()
-                        if self.state_mode == "gripper_only"
-                        else umi_dual_franka_policy.UmiDualFrankaRelativeOutputs()
+                        umi_dual_franka_policy.UmiDualFrankaRelativeOutputs()
+                        if self.state_mode == "full"
+                        else umi_dual_franka_policy.UmiDualFrankaRelativeGripperOnlyOutputs()
                     ],
                 )
             case "absolute":
                 if self.state_mode != "full":
                     raise ValueError(
-                        "state_mode='gripper_only' requires action_representation='relative'; "
+                        f"state_mode={self.state_mode!r} requires action_representation='relative'; "
                         "the absolute baseline decodes world-frame targets and needs absolute state."
                     )
                 data_transforms = _transforms.Group(
@@ -531,6 +550,8 @@ class LeRobotUmiDualFrankaDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=("action",),
+            state_sequence_keys=("observation.state",) if self.observation_horizon > 1 else (),
+            observation_horizon=self.observation_horizon,
         )
 
 
@@ -1612,6 +1633,32 @@ _CONFIGS = [
         batch_size=128,
         fsdp_devices=8,
         num_workers=32,
+        save_interval=5_000,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # Stack-cubes with a relative-history policy state: instead of the 2-D
+    # gripper vector, the state is the previous observation frame's TCP pose
+    # expressed in the CURRENT TCP frame plus the current absolute grippers,
+    # per arm [rel_xyz(3), rel_rot6d(6), grip_abs(1)] = 20-D. Still carries no
+    # absolute pose, so it stays cross-embodiment and the server keeps
+    # returning relative chunks; observation_horizon=2 loads one history frame.
+    TrainConfig(
+        name="pi05_umi_dual_franka_stack_cubes_relative_history",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotUmiDualFrankaDataConfig(
+            repo_id="local/stack_cubes_tcp_x264",
+            default_prompt="Stack the cubes into a tower",
+            action_representation="relative",
+            state_mode="relative_history",
+            observation_horizon=2,
+            image_crop=224,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10000,
+        batch_size=128,
+        fsdp_devices=8,
+        num_workers=8,
         save_interval=5_000,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",

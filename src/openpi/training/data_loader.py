@@ -138,12 +138,17 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+    # Observation history: negative deltas so each sample carries the window
+    # oldest-first, ending at the current frame. LeRobot clamps requests that
+    # reach before the episode start, so the earliest frames repeat there.
+    horizon = data_config.observation_horizon
+    if horizon > 1:
+        for key in data_config.state_sequence_keys:
+            delta_timestamps[key] = [(t - horizon + 1) / dataset_meta.fps for t in range(horizon)]
+    dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, delta_timestamps=delta_timestamps)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

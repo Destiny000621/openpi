@@ -36,6 +36,12 @@ RAW_ARM_DIM = 8
 RAW_STATE_DIM = 2 * RAW_ARM_DIM
 MODEL_ARM_DIM = 10
 MODEL_STATE_DIM = 2 * MODEL_ARM_DIM
+
+# Policy state representations. "full" is the absolute 20-D pose; the other two
+# carry no absolute pose (cross-embodiment): "gripper_only" is the 2-D absolute
+# gripper vector, "relative_history" is the 20-D observation-window pose
+# expressed in the current TCP frame plus the current grippers.
+STATE_MODES = ("full", "gripper_only", "relative_history")
 GRIPPER_STATE_DIM = 2
 
 _EPS = 1e-8
@@ -324,20 +330,23 @@ def relative20_actions_to_raw16(current_absolute20_state: np.ndarray, relative20
 ROT6D_ACTION_DIMS = (*range(3, 9), *range(MODEL_ARM_DIM + 3, MODEL_ARM_DIM + 9))
 
 
-def neutralize_rot6d_action_norm_stats(norm_stats: dict | None) -> dict | None:
-    """Return stats whose 12 rot6d action dims normalize to identity.
+def neutralize_rot6d_norm_stats(norm_stats: dict | None, *, keys: tuple[str, ...] = ("actions",)) -> dict | None:
+    """Neutralize the rot6d dimensions of the given norm-stat entries.
 
     Neutral parameters (mean 0 / std 1 / q01 -1 / q99 +1) make both z-score and
-    quantile normalization pass rot6d values through unchanged (up to the
-    normalizer's 1e-6 epsilon). rot6d components are rotation-matrix entries,
-    inherently bounded in [-1, 1] and geometrically meaningful; skipping their
-    per-dim scaling keeps the training loss on the undistorted rotation
-    manifold and lets the network emit raw rot6d that feeds
-    ``rotation_6d_to_matrix`` directly. Translation and gripper dims keep
-    their data-driven statistics. Applied to stats FILES (not at load time) so
-    each checkpoint's embedded stats always describe its own training exactly.
+    quantile normalization pass those dimensions through unchanged (up to the
+    normalizer's epsilon). rot6d components are rotation-matrix entries, already
+    bounded in [-1, 1] and geometrically meaningful, so they are fed to the model
+    raw and reach ``rotation_6d_to_matrix`` untouched. Translation and gripper
+    dimensions keep their data-driven statistics.
+
+    ``keys`` selects which entries to patch: ``"actions"`` always applies;
+    ``"state"`` applies to the 20-D relative-history state, whose arm blocks use
+    the identical ``[xyz(3), rot6d(6), gripper(1)]`` layout. Entries that are
+    missing, or whose dimension is too small to contain rot6d (the 2-D
+    gripper-only state), are left alone.
     """
-    if norm_stats is None or "actions" not in norm_stats:
+    if norm_stats is None:
         return norm_stats
 
     def _patched(array, value):
@@ -347,15 +356,58 @@ def neutralize_rot6d_action_norm_stats(norm_stats: dict | None) -> dict | None:
         flat[list(ROT6D_ACTION_DIMS)] = value
         return flat
 
-    actions = norm_stats["actions"]
-    patched = dataclasses.replace(
-        actions,
-        mean=_patched(actions.mean, 0.0),
-        std=_patched(actions.std, 1.0),
-        q01=_patched(actions.q01, -1.0),
-        q99=_patched(actions.q99, 1.0),
-    )
-    return {**norm_stats, "actions": patched}
+    patched = dict(norm_stats)
+    for key in keys:
+        entry = patched.get(key)
+        if entry is None or np.asarray(entry.mean).reshape(-1).shape[-1] < MODEL_STATE_DIM:
+            continue
+        patched[key] = dataclasses.replace(
+            entry,
+            mean=_patched(entry.mean, 0.0),
+            std=_patched(entry.std, 1.0),
+            q01=_patched(entry.q01, -1.0),
+            q99=_patched(entry.q99, 1.0),
+        )
+    return patched
+
+
+def neutralize_rot6d_action_norm_stats(norm_stats: dict | None) -> dict | None:
+    """Backwards-compatible wrapper: neutralize only the action rot6d dims."""
+    return neutralize_rot6d_norm_stats(norm_stats, keys=("actions",))
+
+
+def raw16_history_to_relative_state20(raw_states: np.ndarray) -> np.ndarray:
+    """Encode an observation history as a relative 20-D policy state.
+
+    ``raw_states`` carries the observation window oldest-first with shape
+    ``(..., H, 16)``; the last row is the current frame. Per arm this returns::
+
+        [history_rel_xyz(3), history_rel_rot6d(6), current_gripper_abs(1)]
+
+    where the history pose is expressed in the CURRENT TCP frame,
+    ``T_rel = inverse(T_current) @ T_history`` — the same true-SE(3) convention
+    and row-major rot6d encoding the relative action targets use. Grippers are
+    the current absolute values, never differenced.
+
+    Like the actions, this carries no absolute pose, so it keeps the policy
+    embodiment- and scene-agnostic while exposing recent motion (the signal a
+    single-frame observation cannot provide). A 1-D ``(16,)`` input, or a window
+    whose frames are identical (episode start, where LeRobot clamps the padded
+    history to the current frame), yields an identity relative pose, i.e. "no
+    motion".
+    """
+    raw_states = _as_float_array(raw_states, name="raw dual-Franka state history")
+    _require_last_dim(raw_states, RAW_STATE_DIM, name="raw dual-Franka state history")
+    current = raw_states if raw_states.ndim == 1 else raw_states[..., -1, :]
+    history = raw_states if raw_states.ndim == 1 else raw_states[..., 0, :]
+
+    # Reuse the action encoder for the pose math so the SE(3)/rot6d conventions
+    # cannot drift apart; it takes the gripper from its second argument, so
+    # overwrite both gripper slots with the current absolute values.
+    state20 = np.array(raw16_actions_to_relative20(current, history), copy=True)
+    for model_start, raw_start in ((0, 0), (MODEL_ARM_DIM, RAW_ARM_DIM)):
+        state20[..., model_start + 9] = current[..., raw_start + 7]
+    return state20
 
 
 def relative20_actions_to_relative_raw16(relative20_actions: np.ndarray) -> np.ndarray:
@@ -458,8 +510,8 @@ def center_crop_image(image: np.ndarray, side: int, *, name: str) -> np.ndarray:
 def _build_inputs(
     data: dict, *, relative_actions: bool, state_mode: str = "full", image_crop: int | None = None
 ) -> dict:
-    if state_mode not in ("full", "gripper_only"):
-        raise ValueError(f"state_mode must be either 'full' or 'gripper_only', got {state_mode!r}.")
+    if state_mode not in STATE_MODES:
+        raise ValueError(f"state_mode must be one of {STATE_MODES}, got {state_mode!r}.")
     raw_state = _get_first(
         data,
         ("observation/state", "observation.state", "state"),
@@ -468,9 +520,18 @@ def _build_inputs(
     raw_state = _as_float_array(raw_state, name="raw dual-Franka state")
     _require_last_dim(raw_state, RAW_STATE_DIM, name="raw dual-Franka state")
 
-    # The relative-action anchor below always uses the full raw state; only the
-    # emitted policy state shrinks in gripper-only mode.
-    state = raw16_to_gripper_state2(raw_state) if state_mode == "gripper_only" else raw16_to_absolute20(raw_state)
+    # An observation window arrives oldest-first as (..., H, 16). Everything
+    # anchored on "now" — the relative-action anchor below included — must use
+    # the last row; only the relative-history state reads the earlier frames.
+    current_raw_state = raw_state if raw_state.ndim == 1 else raw_state[..., -1, :]
+
+    match state_mode:
+        case "gripper_only":
+            state = raw16_to_gripper_state2(current_raw_state)
+        case "relative_history":
+            state = raw16_history_to_relative_state20(raw_state)
+        case _:
+            state = raw16_to_absolute20(current_raw_state)
 
     left_image = _parse_image(_get_image(data, "left_head"), name="left_head")
     right_image = _parse_image(_get_image(data, "right_head"), name="right_head")
@@ -496,7 +557,7 @@ def _build_inputs(
         raw_actions = _as_float_array(raw_actions, name="raw dual-Franka actions")
         _require_last_dim(raw_actions, RAW_STATE_DIM, name="raw dual-Franka actions")
         inputs["actions"] = (
-            raw16_actions_to_relative20(raw_state, raw_actions)
+            raw16_actions_to_relative20(current_raw_state, raw_actions)
             if relative_actions
             else raw16_to_absolute20(raw_actions)
         )
@@ -511,21 +572,24 @@ def _build_inputs(
 class UmiDualFrankaRelativeInputs(transforms.DataTransformFn):
     """Map raw UMI observations/actions to the primary pi0.5 representation.
 
-    With ``state_mode="gripper_only"`` the emitted policy state is the 2-D
-    ``[left_gripper, right_gripper]`` vector; the relative action encoding is
-    unchanged (its anchor is always the full raw absolute state).
+    ``state_mode`` selects the policy state: ``"full"`` absolute 20-D pose,
+    ``"gripper_only"`` the 2-D ``[left_gripper, right_gripper]`` vector, or
+    ``"relative_history"`` the 20-D observation-window pose relative to the
+    current TCP frame plus the current grippers. The relative action encoding is
+    unchanged in every mode — its anchor is always the current raw absolute
+    state, i.e. the last frame of the observation window.
     """
 
     model_type: _model.ModelType
-    state_mode: Literal["full", "gripper_only"] = "full"
+    state_mode: Literal["full", "gripper_only", "relative_history"] = "full"
     # Optional centered square crop (pixel side length) applied to both camera
     # views before the model resize, e.g. 272 for the 384 px fisheye views.
     image_crop: int | None = None
 
     def __post_init__(self) -> None:
         _validate_model_type(self.model_type)
-        if self.state_mode not in ("full", "gripper_only"):
-            raise ValueError(f"state_mode must be either 'full' or 'gripper_only', got {self.state_mode!r}.")
+        if self.state_mode not in STATE_MODES:
+            raise ValueError(f"state_mode must be one of {STATE_MODES}, got {self.state_mode!r}.")
 
     def __call__(self, data: dict) -> dict:
         return _build_inputs(
