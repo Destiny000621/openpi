@@ -342,7 +342,12 @@ def test_relative_history_config_contract_and_observation_window(monkeypatch, tm
     assert train_config.data.state_mode == "relative_history"
     assert train_config.data.observation_horizon == 2
     assert train_config.data.image_crop == 224
-    assert train_config.data.repo_id == "local/stack_cubes_tcp_x264"
+    assert train_config.data.repo_id == "local/stack_cubes_takes_x264"
+    assert (train_config.batch_size, train_config.fsdp_devices) == (64, 4)
+    assert (train_config.num_train_steps, train_config.num_workers) == (6000, 16)
+    # Intermediate checkpoints only survive when keep_period divides them.
+    assert train_config.save_interval == 2_000
+    assert train_config.keep_period == 2_000
 
     data_config = train_config.data.create(tmp_path, train_config.model)
     inputs = data_config.data_transforms.inputs[0]

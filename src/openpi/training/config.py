@@ -1647,7 +1647,7 @@ _CONFIGS = [
         name="pi05_umi_dual_franka_stack_cubes_relative_history",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
         data=LeRobotUmiDualFrankaDataConfig(
-            repo_id="local/stack_cubes_tcp_x264",
+            repo_id="local/stack_cubes_takes_x264",
             default_prompt="Stack the cubes into a tower",
             action_representation="relative",
             state_mode="relative_history",
@@ -1655,11 +1655,15 @@ _CONFIGS = [
             image_crop=224,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=10000,
-        batch_size=128,
-        fsdp_devices=8,
-        num_workers=8,
-        save_interval=5_000,
+        num_train_steps=6000,
+        batch_size=64,
+        fsdp_devices=4,
+        num_workers=16,
+        save_interval=2_000,
+        # Match keep_period to save_interval: orbax keeps only the most recent
+        # checkpoint plus those with step % keep_period == 0, so the default
+        # 5_000 would silently prune the 2k and 4k checkpoints.
+        keep_period=2_000,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
