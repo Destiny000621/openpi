@@ -169,6 +169,18 @@ class Pi0(_model.BaseModel):
         pooled = (embs * m).sum(axis=1) / jnp.maximum(m.sum(axis=1), 1.0)
         return pooled.astype(jnp.float32)
 
+    def extract_prefix_last_rep(self, rng: at.KeyArrayLike, observation: _model.Observation):
+        """DSRL official state feature: hidden state of the LAST prefix slot, [b, emb].
+
+        Byte-faithful to nakamotoo/dsrl_pi0: their get_prefix_rep returns the full
+        image+language prefix hidden states and train_utils_real.py:160 slices
+        [:, -1, :] client-side. Same full-prefix forward here (no image_only, no
+        masking, no pooling — slot -1 is usually a right-pad prompt token that
+        attends over the whole prefix, i.e. a de facto readout token); slicing
+        server-side is transport-only. Jit-friendly like extract_image_embedding."""
+        embs, _ = self.extract_prefix_embeddings(rng, observation)
+        return embs[:, -1, :].astype(jnp.float32)
+
     @at.typecheck
     def embed_suffix(
         self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]

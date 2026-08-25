@@ -122,26 +122,33 @@ class Policy(BasePolicy):
     def get_prefix_rep(self, obs: dict) -> dict:
         """DSRL server method: pooled image-token embedding (z_rl) for the SAC state.
 
-        Returns {"prefix_rep": float32 [1, emb]} — the masked mean-pooled image-token
-        embedding from extract_image_embedding, NOT the fork's raw [b, s, emb] hidden
-        state + kv_cache (which shipped megabytes over the wire only to be discarded,
-        and read a possibly-padded token slot at position -1). Works regardless of the
-        SUBRL_RETURN_EMBED serve flag; the jitted extractor is created lazily so plain
-        serving pays nothing.
+        Returns {"prefix_rep": float32 [1, emb]} — the OFFICIAL dsrl_pi0 state feature:
+        the hidden state of the last prefix slot (extract_prefix_last_rep), identical
+        to upstream's client-side hidden_state[:, -1, :] of the full image+language
+        prefix forward (user decision 2026-08-25: official implementation on the
+        state-construction path). Only the transport differs: the slice happens
+        server-side instead of shipping [b, s, emb] + a discarded kv_cache. Works
+        regardless of the SUBRL_RETURN_EMBED serve flag; the jitted extractor is
+        created lazily so plain serving pays nothing.
         """
         if self._is_pytorch_model:
             raise NotImplementedError("get_prefix_rep is only implemented for JAX models")
-        if not hasattr(self._model, "extract_image_embedding"):
-            raise NotImplementedError("model has no extract_image_embedding — serve a pi0/pi0.5 checkpoint")
-        if not hasattr(self, "_extract_embed"):
-            self._extract_embed = nnx_utils.module_jit(self._model.extract_image_embedding)
+        if not hasattr(self._model, "extract_prefix_last_rep"):
+            raise NotImplementedError("model has no extract_prefix_last_rep — serve a pi0/pi0.5 checkpoint")
+        if not hasattr(self, "_dsrl_prefix_embed"):
+            # Deliberately its OWN attribute, not self._extract_embed: under
+            # SUBRL_RLTOKEN the serve replaces _extract_embed with the SubRL
+            # learned-token embed — DSRL's SAC state must stay the official
+            # last-slot feature on every serve variant, or the baseline's z
+            # silently inherits the SubRL token lineage.
+            self._dsrl_prefix_embed = nnx_utils.module_jit(self._model.extract_prefix_last_rep)
 
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
         observation = _model.Observation.from_dict(inputs)
         # rng is unused on the train=False path of extract_prefix_embeddings; passed for signature parity.
-        emb = np.asarray(self._extract_embed(self._rng, observation), np.float32)
+        emb = np.asarray(self._dsrl_prefix_embed(self._rng, observation), np.float32)
         return {"prefix_rep": emb}
 
     @property
