@@ -1528,6 +1528,89 @@ _CONFIGS = [
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
+    # Earbuds: our own YAM teleop (38 eps / 57,365 frames, local/earbuds_30fps_v21) merged
+    # with the YELLOW-GRIPPER subset of ABC-130k earbuds (244 of 500 eps / 855,727 frames).
+    # ABC episodes come from two gripper hardware variants; only the yellow ones match our
+    # station, so the black-gripper half is excluded (classification + verification in
+    # abc_earbuds/gripper_classification.json). Merged with scripts/merge_lerobot_v21.py
+    # into local/earbuds_teleop_abcyellow_v21 -> 282 eps / 913,092 frames @30fps.
+    # Note our teleop is only ~6.3% of frames; the two source task strings differ but
+    # default_prompt (prompt_from_task=False) gives every frame the same instruction.
+    TrainConfig(
+        name="pi05_yam_earbuds_teleop_abcyellow",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/earbuds_teleop_abcyellow_v21",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            adapt_to_pi=False,
+            default_prompt="insert the wireless bluetooth earbuds into the charging case",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head_camera",
+                                "cam_left_wrist": "observation.images.left_wrist_camera",
+                                "cam_right_wrist": "observation.images.right_wrist_camera",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        save_interval=1_000,
+        keep_period=5_000,
+        batch_size=128,
+        fsdp_devices=8,
+        num_workers=16,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # teleoperation data only
+    TrainConfig(
+        name="pi05_yam_earbuds_teleop",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/earbuds_30fps_v21",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            adapt_to_pi=False,
+            default_prompt="insert the wireless bluetooth earbuds into the charging case",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.head_camera",
+                                "cam_left_wrist": "observation.images.left_wrist_camera",
+                                "cam_right_wrist": "observation.images.right_wrist_camera",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=6_000,
+        save_interval=2_000,
+        keep_period=2_000,
+        batch_size=128,
+        fsdp_devices=8,
+        num_workers=16,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
     TrainConfig(
         name="pi05_yam_abc_fold_box",
         model=pi0_config.Pi0Config(pi05=True),
@@ -1833,7 +1916,10 @@ _CONFIGS = [
             normalize_rot6d=False,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=6_000,
+        # Extended 6k -> 10k by resuming from v1/5999: at 6k the cosine LR was
+        # still ~94% of peak (decay_steps=30k) and open-loop error was still
+        # falling ~20% per 2k steps. The schedule is step-based -> LR-continuous.
+        num_train_steps=10_000,
         save_interval=2_000,
         keep_period=2_000,
         batch_size=128,
