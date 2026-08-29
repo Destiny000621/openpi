@@ -1957,7 +1957,7 @@ _CONFIGS = [
             wrist_crop=(0.339, 0.17, 0.761, 0.92),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=6_000,
+        num_train_steps=10_000,
         save_interval=2_000,
         keep_period=2_000,
         batch_size=128,
