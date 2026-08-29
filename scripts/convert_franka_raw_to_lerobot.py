@@ -201,6 +201,54 @@ def _read_video(path: Path, max_side: int = 640) -> np.ndarray:
     return np.stack(frames)
 
 
+def _frames_for_ticks(ep: Path, cam: str, ticks: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pair camera frames to control-loop rows by TIMESTAMP, not index.
+
+    The recorder writes one mp4 frame per UNIQUE ZED capture (dropped frames are
+    deduped) but one state/action row per 30 Hz tick, so index pairing drifts:
+    every drop event shifts all later frames one row earlier, accumulating up to
+    +0.44 s of image-leads-state skew by episode end — worst exactly in the
+    insertion phase, and the paired image comes from the FUTURE of its row (a
+    causal shortcut the synchronous deploy client cannot reproduce). Measured on
+    the double_cable_100 raw data: 94/100 episodes had >20 ms insertion-phase
+    skew, 40/100 had >100 ms (up to +265 ms).
+
+    This selects, for each tick, the newest frame captured AT OR BEFORE that
+    tick — the same "latest available frame" semantics the rollout client sees.
+
+    Args:
+        ep: Episode directory (contains ``{cam}.mp4`` + ``{cam}_timestamps.npy``).
+        cam: ``"camera0"`` / ``"camera1"``.
+        ticks: Per-row loop timestamps (s epoch), truncated to the row count.
+
+    Returns:
+        ``(frames, idx, age_s)``: decoded frames ``(N_f, H, W, 3)``, per-row
+        frame index ``(len(ticks),)`` into ``frames``, and per-row image age
+        ``tick - frame_ts`` in seconds (>= 0 except leading warmup rows).
+    """
+    frames = _read_video(ep / f"{cam}.mp4")
+    ts_path = ep / f"{cam}_timestamps.npy"
+    if not ts_path.exists():  # legacy episode without per-frame stamps
+        logger.warning(
+            "%s missing — falling back to INDEX pairing for %s (skew uncorrected)", ts_path.name, ep.name
+        )
+        idx = np.minimum(np.arange(len(ticks)), len(frames) - 1)
+        return frames, idx, np.zeros(len(ticks))
+    cam_ts = np.load(ts_path).astype(np.float64)
+    if cam_ts.size and cam_ts[0] > 1e11:  # ms epoch -> s (loop ticks are s epoch)
+        cam_ts = cam_ts / 1000.0
+    if len(cam_ts) > 1 and not np.all(np.diff(cam_ts) > 0):  # searchsorted needs sorted stamps
+        logger.warning("%s %s: non-monotonic frame stamps — falling back to INDEX pairing", ep.name, cam)
+        idx = np.minimum(np.arange(len(ticks)), len(frames) - 1)
+        return frames, idx, np.zeros(len(ticks))
+    m = min(len(frames), len(cam_ts))
+    if len(frames) != len(cam_ts):
+        logger.warning("%s %s: %d mp4 frames vs %d stamps — truncating to %d", ep.name, cam, len(frames), len(cam_ts), m)
+    frames, cam_ts = frames[:m], cam_ts[:m]
+    idx = np.clip(np.searchsorted(cam_ts, ticks, side="right") - 1, 0, m - 1)
+    return frames, idx, ticks - cam_ts[idx]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input-dir", type=Path, required=True, help="Dataset root (contains session dirs).")
@@ -321,23 +369,35 @@ def main() -> None:
                 [action_quat.astype(np.float32), target_pose[:, 4:7], _gripper(ac, "gripper_target", "joint_targets")],
                 axis=1,
             )
-        cam0 = _read_video(ep / "camera0.mp4")  # wrist
-        cam1 = _read_video(ep / "camera1.mp4")  # side
-
-        t = min(len(state), len(action), len(cam0), len(cam1))
-        if len({len(state), len(action), len(cam0), len(cam1)}) != 1:
+        # Timestamp-correct image pairing (see _frames_for_ticks): each row gets
+        # the newest frame captured at or before its loop tick — matching the
+        # deploy client's latest-available-frame semantics, never future frames.
+        ticks = np.load(ep / "timestamps.npy").astype(np.float64)
+        t = min(len(state), len(action), len(ticks))
+        if t < 60:  # < 2 s at 30 Hz: aborted recording (e.g. instant start/stop).
+            # Every action window from such an episode is dominated by
+            # end-of-episode padding (repeated final frame) — pure junk labels.
+            logger.warning("ep %s has only %d rows — SKIPPING degenerate episode", ep.name, t)
+            continue
+        if len({len(state), len(action), len(ticks)}) != 1:
             logger.warning(
-                "ep %s length mismatch state=%d action=%d cam0=%d cam1=%d -> %d",
-                ep.name, len(state), len(action), len(cam0), len(cam1), t,
+                "ep %s length mismatch state=%d action=%d ticks=%d -> %d",
+                ep.name, len(state), len(action), len(ticks), t,
             )
+        cam0, idx0, age0 = _frames_for_ticks(ep, "camera0", ticks[:t])  # wrist
+        cam1, idx1, age1 = _frames_for_ticks(ep, "camera1", ticks[:t])  # side
+        logger.info(
+            "ep %s image age after pairing: cam0 mean %+.0f/max %+.0f ms, cam1 mean %+.0f/max %+.0f ms",
+            ep.name, 1e3 * age0.mean(), 1e3 * age0.max(), 1e3 * age1.mean(), 1e3 * age1.max(),
+        )
 
         for i in range(t):
             dataset.add_frame(
                 {
                     "observation.state": state[i],
                     "action": action[i],
-                    "observation.images.camera0": cam0[i],
-                    "observation.images.camera1": cam1[i],
+                    "observation.images.camera0": cam0[idx0[i]],
+                    "observation.images.camera1": cam1[idx1[i]],
                     "task": task,
                 }
             )
