@@ -444,6 +444,15 @@ class LeRobotFrankaDataConfig(DataConfigFactory):
     # Unnormalize all consume data_config.norm_stats, the identity override is
     # consistent across the whole lifecycle. True stats stay on disk untouched.
     normalize_rot6d: bool = True
+    # Optional fractional (x0, y0, x1, y1) crop of the WRIST image before the
+    # 224x224 model resize (FrankaInputs.wrist_crop; the UMI image_crop pattern).
+    # Raises effective px-per-mm at the fingertips/port without touching the
+    # dataset or the vision tower; the side camera keeps its full FOV. Serving
+    # contract: the client must send the RAW wrist frame (send_full_wrist: true
+    # in the avantbot session YAML) — FrankaInputs rejects a pre-resized 224x224
+    # wrist image so a mismatched client fails loudly instead of silently
+    # cropping letterbox bars.
+    wrist_crop: tuple[float, float, float, float] | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -469,6 +478,7 @@ class LeRobotFrankaDataConfig(DataConfigFactory):
                     model_type=model_config.model_type,
                     state_dim=self.state_dim,
                     wrist_camera_only=self.wrist_camera_only,
+                    wrist_crop=self.wrist_crop,
                 )
             ],
             outputs=[franka_policy.FrankaOutputs(action_dim=10 if rot6d else 8)],
@@ -1829,6 +1839,69 @@ _CONFIGS = [
         batch_size=128,
         fsdp_devices=8,
         num_workers=32,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # Wrist-crop variant of the dc100 rawrot recipe: identical data/model except
+    # FrankaInputs crops the wrist image to the fractional box (0.339, 0.17,
+    # 0.761, 0.92) before the 224x224 resize. The box is DATA-DRIVEN (2026-08-27
+    # sweep of all 100 raw demos + 6 Aug-21 evals, orange-port detection):
+    # target-port containment 100% insert / 99.8% grasp / 95.5% eval frames /
+    # 89% approach (the rest are early-descent frames where the port is outside
+    # even the full frame). Square-ish crop kills the 16:9 letterbox waste too:
+    # px-per-mm at the port rises 2.37x (an RJ45 socket ~14x10 -> ~33x24 px),
+    # more than a full-frame 448 input would give (2.0x) at zero extra compute —
+    # motivation: Aug-21 evals failed on cm-level insertion aim (attempts
+    # scattered 12-44 mm; measured z passed 30 mm below the demo contact floor).
+    # Serving: client must send the RAW wrist frame — session YAML
+    # franka_pi05_ee_fr3_wcrop.yaml sets send_full_wrist: true; a pre-resized
+    # 224x224 wrist input is rejected loudly by FrankaInputs.
+    # Run compute_norm_stats for this config name once (assets are per-name;
+    # values are identical to the dc100 ones — images don't enter norm stats).
+    TrainConfig(
+        name="pi05_franka_double_cable_100_r6_rawrot_wcrop",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotFrankaDataConfig(
+            repo_id="local/double_cable_100_r6_v21",
+            default_prompt="Unplug the two cables from the right router, then insert them into the left router",
+            use_delta_joint_actions=True,
+            state_dim=10,
+            action_representation="rot6d10",
+            normalize_rot6d=False,
+            wrist_crop=(0.339, 0.17, 0.761, 0.92),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=6_000,
+        save_interval=2_000,
+        keep_period=2_000,
+        batch_size=128,
+        fsdp_devices=8,
+        num_workers=32,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # Same recipe as the 100-episode config, on the 99-episode re-converted
+    # set (local/double_cable_99_r6_v21, 115,666 frames — a different episode
+    # selection, not dc100 minus one). Separate config name so the dc100
+    # checkpoints keep their provenance and norm-stats stay per-dataset.
+    TrainConfig(
+        name="pi05_franka_double_cable_99_r6_rawrot",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotFrankaDataConfig(
+            repo_id="local/double_cable_99_r6_v21",
+            default_prompt="Unplug the two cables from the right router, then insert them into the left router",
+            use_delta_joint_actions=True,
+            state_dim=10,
+            action_representation="rot6d10",
+            normalize_rot6d=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        save_interval=2_000,
+        keep_period=2_000,
+        batch_size=64,
+        fsdp_devices=4,
+        num_workers=16,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),

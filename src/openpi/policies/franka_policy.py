@@ -39,6 +39,28 @@ def _parse_image(image) -> np.ndarray:
     return image
 
 
+def _crop_frac(image: np.ndarray, box: tuple[float, float, float, float], *, name: str) -> np.ndarray:
+    """Crop an HWC image to a fractional (x0, y0, x1, y1) box of the FULL camera frame.
+
+    Fractions (not pixels) so the same box applies to the dataset's stored frames
+    (640x360) and a live client's raw frames (1280x720). A 224x224 input is
+    rejected loudly: it means the client pre-applied resize_with_pad, baking in
+    letterbox bars the fractions were never measured against — silently cropping
+    that would feed the model a garbage view.
+    """
+    h, w = image.shape[:2]
+    if (h, w) == (224, 224):
+        raise ValueError(
+            f"wrist_crop is set but '{name}' arrived already model-sized (224x224). "
+            "Crop-enabled checkpoints need the RAW wrist frame: set send_full_wrist: true "
+            "in the client session YAML so the server can crop before resizing."
+        )
+    x0, y0, x1, y1 = box
+    if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
+        raise ValueError(f"wrist_crop must be fractions 0<=x0<x1<=1, 0<=y0<y1<=1, got {box}")
+    return image[round(y0 * h) : round(y1 * h), round(x0 * w) : round(x1 * w)]
+
+
 @dataclasses.dataclass(frozen=True)
 class FrankaInputs(transforms.DataTransformFn):
     """Inputs transform for a single-arm Franka FR3 (8-D EE actions, 2 cameras).
@@ -66,6 +88,14 @@ class FrankaInputs(transforms.DataTransformFn):
     # standard missing-camera pattern), the wrist stays in its left_wrist_0_rgb
     # slot. Inference clients may then omit "observation/image" entirely.
     wrist_camera_only: bool = False
+    # Optional fractional (x0, y0, x1, y1) crop of the WRIST image, applied before
+    # the model-side 224x224 resize (same idea as the UMI configs' image_crop). A
+    # square-ish crop both zooms the fingertip/port region AND removes the 16:9
+    # letterbox waste, raising px-per-mm at the insertion target ~2.4x. The box
+    # ships in the TrainConfig so train and serve can never drift; clients must
+    # send the raw (un-resized) wrist frame — a 224x224 wrist input is rejected.
+    # The side camera keeps its full FOV for scene context.
+    wrist_crop: tuple[float, float, float, float] | None = None
 
     def __call__(self, data: dict) -> dict:
         state = np.asarray(data["observation/state"])
@@ -87,6 +117,8 @@ class FrankaInputs(transforms.DataTransformFn):
                 [state[..., :3], np.clip(state[..., 3:9], -1.0, 1.0), state[..., 9:]], axis=-1
             )
         wrist_image = _parse_image(data["observation/wrist_image"])
+        if self.wrist_crop is not None:
+            wrist_image = _crop_frac(wrist_image, self.wrist_crop, name="observation/wrist_image")
         if self.wrist_camera_only:
             base_image = np.zeros_like(wrist_image)
         else:

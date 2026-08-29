@@ -195,6 +195,23 @@ Other knobs on `LeRobotFrankaDataConfig`:
   task string only matters under `prompt_from_task=True`. Changing the prompt
   needs no reconversion and no norm-stats redo — but the deploy client's prompt
   must match the training prompt exactly.
+- `wrist_crop=(x0, y0, x1, y1)` — fractional crop of the **wrist** image inside
+  `FrankaInputs`, before the 224×224 model resize (the UMI `image_crop` idea).
+  Config `pi05_franka_double_cable_100_r6_rawrot_wcrop` uses
+  `(0.339, 0.17, 0.761, 0.92)`, a data-driven box (orange-port containment over
+  all 100 raw demos + the 6 Aug-21 evals: insert 100%, grasp 99.8%, eval 95.5%,
+  approach 89%). A square-ish crop also removes the 16:9 letterbox waste, so
+  px-per-mm at the port rises **2.37×** (RJ45 socket ~14×10 → ~33×24 px in the
+  model input) — more than a 448×448 input would give (2.0×), at zero extra
+  compute. Motivation: the Aug-21 evals failed on cm-level insertion aim
+  (attempts scattered 12–44 mm; a socket needs px-level discrimination the old
+  letterboxed view couldn't carry). No reconversion needed (crop is a
+  transform), but the client contract changes: the rollout client must send the
+  **raw** wrist frame (`send_full_wrist: true` in the avantbot session YAML
+  `policy/franka_pi05_ee_fr3_wcrop`); `FrankaInputs` rejects a pre-resized
+  224×224 wrist image so a mismatched client fails loudly. Run
+  `compute_norm_stats` once for the new config name (per-name assets dir; the
+  values are identical — images never enter norm stats).
 
 ## 3. Compute norm-stats
 
@@ -247,8 +264,8 @@ uv run python scripts/push_to_hub.py \
 
 ```bash
 uv run python scripts/serve_policy.py --port=8111 policy:checkpoint \
-  --policy.config=pi05_franka_double_cable_left_r6_rawrot \
-  --policy.dir=<checkpoint_base_dir>/pi05_franka_double_cable_left_r6_rawrot/v1/3999
+  --policy.config=pi05_franka_double_cable_100_r6_rawrot \
+  --policy.dir=/home/boyuan/.cache/openpi/hf/pi05_franka_double_cable_100_r6_rawrot_6k
 ```
 
 ### Wire contract for the inference client
@@ -272,6 +289,10 @@ request = {
 ```
 
 Images may be HWC or CHW at any resolution — the server resizes to 224×224.
+Exception: under a `wrist_crop` config (`..._wcrop`) the **wrist** image must be
+the raw camera frame (any true camera resolution; NOT pre-resized to 224×224 —
+the server rejects that) so `FrankaInputs` can crop the trained fractional box
+before its own resize. The avantbot client's `send_full_wrist: true` does this.
 
 Response — `{"actions": np.f32(50, 10)}`, **absolute** `[xyz, rot6d, gripper]`:
 the server re-anchors every chunk to the request-time state (`AbsoluteActions`)
