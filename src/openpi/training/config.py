@@ -2007,10 +2007,36 @@ _CONFIGS = [
             normalize_rot6d=False,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=4_000,
-        save_interval=1_000,
-        keep_period=1_000,
-        batch_size=64,
+        num_train_steps=8_000,
+        save_interval=4_000,
+        keep_period=4_000,
+        batch_size=80,
+        fsdp_devices=4,
+        num_workers=32,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
+    # Joints-in-state (17-D) on the 100-episode set. Dataset re-converted from
+    # the raw dc100 recordings with --include-joints, so it ALSO carries the
+    # timestamp-correct camera pairing fix (5652432) that the older
+    # double_cable_100_r6_v21 predates — a comparison against those checkpoints
+    # confounds joints + pairing. Same recipe as the 36-ep _joint config.
+    TrainConfig(
+        name="pi05_franka_double_cable_100_r6_rawrot_joint",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotFrankaDataConfig(
+            repo_id="local/double_cable_100_r6j_v21",
+            default_prompt="Unplug the two cables from the right router, then insert them into the left router",
+            use_delta_joint_actions=True,
+            state_dim=17,
+            action_representation="rot6d10",
+            normalize_rot6d=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=8_000,
+        save_interval=4_000,
+        keep_period=4_000,
+        batch_size=80,
         fsdp_devices=4,
         num_workers=32,
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
