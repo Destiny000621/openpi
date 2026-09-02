@@ -270,6 +270,20 @@ def main() -> None:
         "--episode-list", type=Path, default=None,
         help="Optional file with one episode dir (path or name) per line; only those are converted.",
     )
+    ap.add_argument(
+        "--max-tail-image-age-ms", type=float, default=100.0,
+        help="Trim TRAILING rows whose freshest camera frame is older than this. The recorder "
+        "stops the cameras a beat before the control loop, so the last ~2-4 rows of every "
+        "episode repeat the final frame (measured: 214/216 of all >100 ms-stale ticks in "
+        "double_cable_100 sit at the episode end). Those rows carry stale images AND "
+        "end-of-episode action padding — junk either way. 0 disables.",
+    )
+    ap.add_argument(
+        "--max-image-age-ms", type=float, default=0.0,
+        help="Skip episodes with MID-episode image staleness above this (a real camera stall, "
+        "not the stop transient). Healthy recordings never trip a 300 ms threshold "
+        "(double_cable_100 mid-episode worst is ~135 ms). 0 disables.",
+    )
     args = ap.parse_args()
 
     out_root = HF_LEROBOT_HOME / args.repo_id
@@ -390,6 +404,26 @@ def main() -> None:
             "ep %s image age after pairing: cam0 mean %+.0f/max %+.0f ms, cam1 mean %+.0f/max %+.0f ms",
             ep.name, 1e3 * age0.mean(), 1e3 * age0.max(), 1e3 * age1.mean(), 1e3 * age1.max(),
         )
+        age_ms = 1e3 * np.maximum(age0, age1)
+        if args.max_tail_image_age_ms > 0:
+            keep = t
+            while keep > 0 and age_ms[keep - 1] > args.max_tail_image_age_ms:
+                keep -= 1
+            if keep < t:
+                logger.info(
+                    "ep %s: trimming %d stale-image tail rows (max age %.0f ms) — recording-stop transient",
+                    ep.name, t - keep, age_ms[keep:t].max(),
+                )
+                t = keep
+        if args.max_image_age_ms > 0 and (age_ms[:t] > args.max_image_age_ms).any():
+            logger.warning(
+                "ep %s: MID-episode image staleness %.0f ms > %.0f ms (camera stall) — SKIPPING episode",
+                ep.name, age_ms[:t].max(), args.max_image_age_ms,
+            )
+            continue
+        if t < 60:
+            logger.warning("ep %s has only %d rows after tail trim — SKIPPING degenerate episode", ep.name, t)
+            continue
 
         for i in range(t):
             dataset.add_frame(

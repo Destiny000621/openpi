@@ -1991,6 +1991,36 @@ _CONFIGS = [
         checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
         assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
     ),
+    # Wrist-crop ON the timestamp-correct dataset — the un-confounded crop run
+    # (the first wcrop, dc100-based, trained on the leak-paired v21 images).
+    # Same crop box as the dc100 wcrop (derived from the same raw recordings,
+    # so the containment sweep carries over: insert 100% / grasp 99.8%). Same
+    # serving contract: client must send the RAW wrist frame
+    # (send_full_wrist: true, session policy/franka_pi05_ee_fr3_wcrop).
+    # 12k steps: the dc100 wcrop was still improving 6k -> 10k, so give the
+    # crop-adapted vision extra budget. Run compute_norm_stats for this name.
+    TrainConfig(
+        name="pi05_franka_double_cable_99_r6_rawrot_wcrop",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotFrankaDataConfig(
+            repo_id="local/double_cable_99_r6_v21",
+            default_prompt="Unplug the two cables from the right router, then insert them into the left router",
+            use_delta_joint_actions=True,
+            state_dim=10,
+            action_representation="rot6d10",
+            normalize_rot6d=False,
+            wrist_crop=(0.339, 0.17, 0.761, 0.92),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=12_000,
+        save_interval=2_000,
+        keep_period=2_000,
+        batch_size=64,
+        fsdp_devices=4,
+        num_workers=16,
+        checkpoint_base_dir="/mnt/localssd/Sichang/openpi-checkpoints",
+        assets_base_dir="/mnt/localssd/Sichang/openpi-assets",
+    ),
     # Joints-in-state variant: identical to _r6_rawrot except the state carries
     # the 7 arm joint positions appended behind the pose prefix — 17-D
     # [xyz, rot6d, gripper, j0..j6] (dataset converted with --include-joints).
