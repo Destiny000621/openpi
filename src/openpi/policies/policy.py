@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 import logging
+import os
 import pathlib
 import time
 from typing import Any, TypeAlias
@@ -62,6 +63,35 @@ class Policy(BasePolicy):
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            # SubRL: also return pi0.5's pooled image embedding (RLT z_rl) from infer()
+            # so the online-RL critic/actor can condition on what the VLA sees. Off by
+            # default; enable with SUBRL_RETURN_EMBED=1 at serve time. SUBRL_RLTOKEN=<npz>
+            # swaps the mean-pool readout for a trained RL-token encoder (same 2048-d
+            # output, so learner/replay/agent are untouched); it fails loudly on a
+            # missing npz rather than silently falling back to the mean-pool.
+            self._return_embed = (
+                os.environ.get("SUBRL_RETURN_EMBED") == "1" and hasattr(model, "extract_image_embedding")
+            )
+            if self._return_embed:
+                rltoken_path = os.environ.get("SUBRL_RLTOKEN", "").strip()
+                if rltoken_path:
+                    from openpi.models import rl_token as _rl_token  # noqa: PLC0415
+
+                    encoder = _rl_token.load_encoder(rltoken_path)  # raises if missing/invalid
+                    extract_tokens = nnx_utils.module_jit(model.extract_image_tokens)
+
+                    def _embed_with_token(rng_key, observation):  # noqa: ANN001, ANN202
+                        embs, mask = extract_tokens(rng_key, observation)
+                        return encoder(np.asarray(embs), np.asarray(mask))
+
+                    self._extract_embed = _embed_with_token
+                    logging.info("SubRL: serving RL-token z_rl from %s", rltoken_path)
+                else:
+                    # JIT the embedding extraction like sample_actions — an eager
+                    # version runs a full un-jitted prefix forward per infer and
+                    # stalls the robot at every replan.
+                    self._extract_embed = nnx_utils.module_jit(model.extract_image_embedding)
+                    logging.info("SubRL: serving mean-pool z_rl (SUBRL_RETURN_EMBED=1)")
             self._rng = rng or jax.random.key(0)
 
     @override
@@ -100,6 +130,9 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
+        if not self._is_pytorch_model and getattr(self, "_return_embed", False):
+            # jitted pooled image-token embedding -> [emb] (RLT z_rl); first call compiles
+            outputs["image_embedding"] = np.asarray(self._extract_embed(self._rng, observation)[0], np.float32)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

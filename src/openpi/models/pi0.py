@@ -1,4 +1,5 @@
 import logging
+import os
 
 import einops
 import flax.nnx as nnx
@@ -135,6 +136,71 @@ class Pi0(_model.BaseModel):
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
+
+    def extract_prefix_embeddings(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        train: bool = False,
+        image_only: bool = False,
+    ):
+        """SubRL/RLT: post-transformer prefix embeddings — the RL-state (z_rl) source.
+
+        Prefix-only PaliGemma forward; returns (embeddings [b, s, emb], mask [b, s]).
+        image_only drops the language tokens. Enabled at serve time via
+        SUBRL_RETURN_EMBED=1 (see policies/policy.py)."""
+        observation = _model.preprocess_observation(rng if train else None, observation, train=train)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        num_language_tokens = (
+            observation.tokenized_prompt.shape[1] if observation.tokenized_prompt is not None else 0
+        )
+        num_image_tokens = prefix_tokens.shape[1] - num_language_tokens
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), _ = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        if image_only:
+            prefix_out = prefix_out[:, :num_image_tokens]
+            prefix_mask = prefix_mask[:, :num_image_tokens]
+        return prefix_out, prefix_mask
+
+    def _subrl_view_weights(self, num_image_tokens: int):
+        """Per-view pooling weights from SUBRL_EMBED_WEIGHTS (e.g. "1,4,1"), or None.
+
+        Image views contribute equal-length token blocks in Observation.images order
+        (Franka wcrop serve: base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb — the
+        zeroed right wrist is already excluded by the pooling mask). Parsed at jit
+        trace time, so a weight change requires a serve restart."""
+        raw = os.environ.get("SUBRL_EMBED_WEIGHTS", "").strip()
+        if not raw:
+            return None
+        weights = [float(w) for w in raw.split(",")]
+        if num_image_tokens % len(weights) != 0:
+            raise ValueError(
+                f"SUBRL_EMBED_WEIGHTS has {len(weights)} entries but {num_image_tokens} "
+                "image tokens do not split evenly across them"
+            )
+        per_view = num_image_tokens // len(weights)
+        return jnp.repeat(jnp.asarray(weights, jnp.float32), per_view)
+
+    def extract_image_embedding(self, rng: at.KeyArrayLike, observation: _model.Observation):
+        """Jit-friendly z_rl: masked (optionally view-weighted) MEAN-POOLED image-token
+        embeddings, [b, emb]. No python-bool kwargs and pooling inside jit, so
+        `nnx_utils.module_jit` compiles it once (~like sample_actions) instead of an
+        eager per-call forward that pauses the serve on every replan."""
+        embs, mask = self.extract_prefix_embeddings(rng, observation, image_only=True)
+        m = mask.astype(embs.dtype)[..., None]
+        w = self._subrl_view_weights(embs.shape[1])
+        if w is not None:
+            m = m * w[None, :, None]
+        pooled = (embs * m).sum(axis=1) / jnp.maximum(m.sum(axis=1), 1e-6)
+        return pooled.astype(jnp.float32)
+
+    def extract_image_tokens(self, rng: at.KeyArrayLike, observation: _model.Observation):
+        """Unpooled image-token embeddings + mask, for RL-token extraction/training
+        (SUBRL_RLTOKEN pipeline). Jit-friendly like extract_image_embedding."""
+        embs, mask = self.extract_prefix_embeddings(rng, observation, image_only=True)
+        return embs.astype(jnp.float32), mask
 
     @at.typecheck
     def embed_suffix(
