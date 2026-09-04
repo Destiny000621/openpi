@@ -65,20 +65,48 @@ def _default_dataset() -> pathlib.Path:
 
 
 def _decode_frames(video: pathlib.Path, indices: list[int]) -> dict[int, np.ndarray]:
-    """Decode the requested frame indices from a LeRobot mp4 as RGB uint8 HWC."""
-    import cv2  # noqa: PLC0415
+    """Decode the requested frame indices from a LeRobot mp4 as RGB uint8 HWC.
 
-    cap = cv2.VideoCapture(str(video))
+    PyAV (libdav1d) first: these videos are AV1, and the OpenCV builds on both the
+    robot station and the H200 return False for every read on them — silently, so a
+    cv2-only path produces an empty gate rather than an error you can act on.
+    Decoding is sequential up to max(indices) rather than seek-based: episodes are
+    ~1k frames, we want a handful, and seeking AV1 by frame index means keyframe
+    arithmetic for no gain.
+    """
+    want = set(indices)
+    stop = max(indices)
     out: dict[int, np.ndarray] = {}
     try:
-        for idx in sorted(indices):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ok, frame = cap.read()
-            if not ok:
-                raise RuntimeError(f"Could not decode frame {idx} of {video}")
-            out[idx] = np.ascontiguousarray(frame[..., ::-1])  # BGR -> RGB
-    finally:
-        cap.release()
+        import av  # noqa: PLC0415
+
+        with av.open(str(video)) as container:
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            for i, frame in enumerate(container.decode(stream)):
+                if i in want:
+                    out[i] = np.ascontiguousarray(frame.to_ndarray(format="rgb24"))
+                if i >= stop:
+                    break
+    except ImportError:
+        import cv2  # noqa: PLC0415
+
+        cap = cv2.VideoCapture(str(video))
+        try:
+            for idx in sorted(want):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ok, frame = cap.read()
+                if ok:
+                    out[idx] = np.ascontiguousarray(frame[..., ::-1])  # BGR -> RGB
+        finally:
+            cap.release()
+
+    missing = sorted(want - set(out))
+    if missing:
+        raise RuntimeError(
+            f"Could not decode frames {missing} of {video}. These are AV1; install "
+            "PyAV (`pip install av`) — OpenCV without libdav1d fails silently here."
+        )
     return out
 
 
@@ -165,6 +193,12 @@ def main() -> int:  # noqa: PLR0915, PLR0912, C901
     ap.add_argument("--frames", type=int, default=4, help="frames per episode")
     ap.add_argument("--samples", type=int, default=4, help="noise draws per frame per regime (G4)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--rows-sweep",
+        default="",
+        help="comma-separated noise_rows values (e.g. 1,2,5,10,25,50) — runs ONLY the "
+        "G4 sweep, to find the smallest SAC action space this checkpoint tolerates",
+    )
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -195,6 +229,31 @@ def main() -> int:  # noqa: PLR0915, PLR0912, C901
                 )
             )
     print(f"loaded {len(cases)} demo frames from {args.episodes} episodes\n")
+
+    if args.rows_sweep:
+        # Upstream's fill (`train_utils_sim.py:233-242`): the SAC action is the FIRST
+        # `rows` noise rows; the LAST of them is repeated to fill the horizon. So this
+        # sweep answers exactly "what should --noise_rows be", not some other scheme.
+        rows_list = [int(r) for r in args.rows_sweep.split(",")]
+        print("=" * 78)
+        print("G4-sweep  chunk-vs-expert MAE vs noise_rows (upstream last-row fill)")
+        print(f"    {'rows':>6}{'SAC action dim':>16}{'pos MAE (mm)':>16}{'rot6d MAE':>12}")
+        base = None
+        for rows in rows_list:
+            per_case = []
+            for _label, req, expert in cases:
+                for _ in range(args.samples):
+                    head = rng.standard_normal((rows, NOISE_DIM)).astype(np.float32)
+                    tail = np.repeat(head[-1:, :], ACTION_HORIZON - rows, axis=0)
+                    noise = np.concatenate([head, tail], axis=0)
+                    chunk = np.asarray(client.infer(dict(req), noise=noise)["actions"])
+                    per_case.append(_mae(chunk, expert))
+            arr = np.asarray(per_case)
+            m = arr.mean(axis=0)
+            base = m[0] if base is None and rows == ACTION_HORIZON else base
+            print(f"    {rows:>6}{rows * NOISE_DIM:>16}{m[0] * 1000:>13.2f} +-{arr[:, 0].std() * 1000:>4.1f}{m[1]:>12.4f}")
+        print("=" * 78)
+        return 0
 
     label0, req0, expert0 = cases[0]
     failures: list[str] = []
