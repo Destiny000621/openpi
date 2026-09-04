@@ -28,8 +28,11 @@ PROMPT = "Unplug the two cables from the right router, then insert them into the
 
 @dataclasses.dataclass
 class Args:
+    # NOTE: data_log/double_lan_insertion_uniform (NO suffix) is the curated
+    # 100-demo set the checkpoint trained on; the timestamped *_YYYYmmdd dirs are
+    # the raw takes it was selected from — globbing both double-counts episodes.
     roots: tuple[str, ...] = (
-        "/home/boyuan/Desktop/Haply_Franka/data_log/double_lan_insertion_uniform*",
+        "/home/boyuan/Desktop/Haply_Franka/data_log/double_lan_insertion_uniform",
         "/home/boyuan/Desktop/Haply_Franka/data_log_eval_wcrop/*",
     )
     out: str = "~/Desktop/SubRL/data/franka_rl_token_corpus"
@@ -40,12 +43,21 @@ class Args:
     max_frames_per_episode: int = 200
 
 
+def _cams(ep: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path] | None:
+    """(wrist, side) video paths — eval uses wrist/external_right, demos camera0/camera1."""
+    for wrist, side in (("wrist", "external_right"), ("camera0", "camera1")):
+        w, s = ep / f"{wrist}.mp4", ep / f"{side}.mp4"
+        if w.exists() and s.exists():
+            return w, s
+    return None
+
+
 def _episode_dirs(roots: tuple[str, ...]) -> list[pathlib.Path]:
     out = []
     for root in roots:
         for session in sorted(glob.glob(str(pathlib.Path(root).expanduser()))):
             out += sorted(pathlib.Path(session).glob("episode_*"))
-    return [e for e in out if (e / "wrist.mp4").exists() and (e / "arm0_states.npz").exists()]
+    return [e for e in out if _cams(e) is not None and (e / "arm0_states.npz").exists()]
 
 
 def _state10(states: np.lib.npyio.NpzFile, i: int) -> np.ndarray:
@@ -55,7 +67,10 @@ def _state10(states: np.lib.npyio.NpzFile, i: int) -> np.ndarray:
     ee = states["ee_pose"][i]
     rot = Rotation.from_quat([ee[1], ee[2], ee[3], ee[0]])  # wxyz -> xyzw
     r6 = rot.as_matrix()[:, :2].T.reshape(-1)
-    grip = float(np.clip(1.0 - states["gripper_pos"][i, 0], 0.0, 1.0)) * 0.7929
+    if "gripper_pos" in states.files:  # eval format: normalized, 1 = open
+        grip = float(np.clip(1.0 - states["gripper_pos"][i, 0], 0.0, 1.0)) * 0.7929
+    else:  # old demo format: knuckle radians as the 8th joint column
+        grip = float(states["joint_pos"][i, 7])
     return np.concatenate([ee[4:7], r6, [grip]]).astype(np.float32)
 
 
@@ -98,16 +113,25 @@ def main(args: Args) -> None:
     episodes = _episode_dirs(args.roots)
     print(f"{len(episodes)} episodes")
     for ep in episodes:
-        states = np.load(ep / "arm0_states.npz")
-        ts = np.load(ep / "timestamps.npy")
-        wrist_ts = np.load(ep / "wrist_timestamps.npy") / 1000.0
-        ext_ts = np.load(ep / "external_right_timestamps.npy") / 1000.0
-        success = json.loads((ep / "metadata.json").read_text()).get("success", False)
-        step = max(1, int(round((1.0 / args.hz) / max(np.median(np.diff(ts)), 1e-3))))
+        try:
+            wrist_mp4, side_mp4 = _cams(ep)
+            states = np.load(ep / "arm0_states.npz")
+            ts = np.load(ep / "timestamps.npy")
+            wrist_ts = np.load(wrist_mp4.with_name(wrist_mp4.stem + "_timestamps.npy")) / 1000.0
+            ext_ts = np.load(side_mp4.with_name(side_mp4.stem + "_timestamps.npy")) / 1000.0
+            success = json.loads((ep / "metadata.json").read_text()).get("success", False)
+            dt = np.median(np.diff(ts)) if len(ts) > 10 else float("nan")
+            if not np.isfinite(dt) or dt <= 0:
+                print(f"skip {ep.name}: bad timestamps (n={len(ts)}, dt={dt})")
+                continue
+        except Exception as exc:  # noqa: BLE001 — one corrupt episode must not kill the run
+            print(f"skip {ep.name}: {exc}")
+            continue
+        step = max(1, int(round((1.0 / args.hz) / max(dt, 1e-3))))
         ticks = list(range(0, len(ts), step))[: args.max_frames_per_episode]
 
-        wcap = cv2.VideoCapture(str(ep / "wrist.mp4"))
-        ecap = cv2.VideoCapture(str(ep / "external_right.mp4"))
+        wcap = cv2.VideoCapture(str(wrist_mp4))
+        ecap = cv2.VideoCapture(str(side_mp4))
         try:
             for tick in ticks:
                 widx = int(np.argmin(np.abs(wrist_ts - ts[tick])))
