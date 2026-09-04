@@ -138,6 +138,41 @@ class Policy(BasePolicy):
         }
         return outputs
 
+    def get_prefix_rep(self, obs: dict) -> dict:
+        """DSRL state feature: `{"prefix_rep": float32 [1, emb]}` for one observation.
+
+        Runs the SAME prefix forward `infer` would, but stops before the flow-matching
+        denoise loop, so it is strictly cheaper than a full inference. Exposed as its
+        own serve method (`method="get_prefix_rep"`) because DSRL needs z_rl BEFORE it
+        picks the noise it will hand to `infer` — the two calls cannot be merged.
+
+        Deliberately independent of `SUBRL_RETURN_EMBED` / `SUBRL_RLTOKEN`: the SubRL
+        hooks swap `image_embedding` for a trained RL-token readout, and DSRL's
+        baseline must keep the upstream last-prefix-slot feature no matter how the
+        serve is launched for SubRL. Compiled lazily on first call so serves that
+        never do DSRL pay nothing.
+        """
+        if self._is_pytorch_model:
+            raise NotImplementedError("prefix_rep is JAX-only (DSRL serves a JAX pi0.5).")
+        if not hasattr(self._model, "extract_prefix_last_rep"):
+            raise NotImplementedError(
+                f"{type(self._model).__name__} has no extract_prefix_last_rep; "
+                "get_prefix_rep needs a pi0/pi0.5 model."
+            )
+        if getattr(self, "_dsrl_prefix_embed", None) is None:
+            self._dsrl_prefix_embed = nnx_utils.module_jit(self._model.extract_prefix_last_rep)
+
+        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._input_transform(inputs)
+        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+        observation = _model.Observation.from_dict(inputs)
+        start_time = time.monotonic()
+        rep = np.asarray(self._dsrl_prefix_embed(self._rng, observation), np.float32)
+        return {
+            "prefix_rep": rep,  # [1, emb] float32 — msgpack cannot pack bfloat16
+            "policy_timing": {"infer_ms": (time.monotonic() - start_time) * 1000},
+        }
+
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
@@ -155,8 +190,8 @@ class PolicyRecorder(_base_policy.BasePolicy):
         self._record_step = 0
 
     @override
-    def infer(self, obs: dict) -> dict:  # type: ignore[misc]
-        results = self._policy.infer(obs)
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        results = self._policy.infer(obs) if noise is None else self._policy.infer(obs, noise=noise)
 
         data = {"inputs": obs, "outputs": results}
         data = flax.traverse_util.flatten_dict(data, sep="/")
@@ -166,3 +201,7 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         np.save(output_path, np.asarray(data))
         return results
+
+    def get_prefix_rep(self, obs: dict) -> dict:
+        """Pass-through so `--record` serves still answer DSRL's get_prefix_rep."""
+        return self._policy.get_prefix_rep(obs)

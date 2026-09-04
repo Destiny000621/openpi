@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from typing_extensions import override
 import websockets.sync.client
@@ -44,8 +44,33 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 time.sleep(5)
 
     @override
-    def infer(self, obs: Dict) -> Dict:  # noqa: UP006
-        data = self._packer.pack(obs)
+    def infer(self, obs: Dict, *, noise: Optional[Any] = None) -> Dict:  # noqa: UP006
+        """Run inference. `noise` (DSRL) seeds the flow-matching integration.
+
+        Shape is `(action_horizon, action_dim)` or `(1, action_horizon, action_dim)` —
+        for pi0.5 that is `(50, 32)`. A fixed noise makes the returned action chunk a
+        deterministic function of the observation; `noise=None` keeps the server's own
+        RNG draw AND the plain-dict wire format, so nothing about the existing
+        rollout/eval path changes.
+        """
+        if noise is None:
+            # Byte-identical to the pre-DSRL client: works against old servers too.
+            data = self._packer.pack(obs)
+        else:
+            data = self._packer.pack({"method": "infer", "obs": {**obs, "noise": noise}})
+        return self._request(data)
+
+    def get_prefix_rep(self, obs: Dict) -> Any:  # noqa: UP006
+        """DSRL z_rl: the last prefix slot's embedding, float32 `[1, emb]`.
+
+        Upstream dsrl_pi0 pulls the full `[b, s, emb]` prefix tensor and slices
+        `[:, -1, :]` itself; this server does the slice before packing, so the caller
+        gets the finished feature. Cheaper than `infer` — no denoise loop.
+        """
+        response = self._request(self._packer.pack({"method": "get_prefix_rep", "obs": obs}))
+        return response["prefix_rep"]
+
+    def _request(self, data: bytes) -> Dict:  # noqa: UP006
         self._ws.send(data)
         response = self._ws.recv()
         if isinstance(response, str):

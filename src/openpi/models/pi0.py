@@ -196,6 +196,25 @@ class Pi0(_model.BaseModel):
         pooled = (embs * m).sum(axis=1) / jnp.maximum(m.sum(axis=1), 1e-6)
         return pooled.astype(jnp.float32)
 
+    def extract_prefix_last_rep(self, rng: at.KeyArrayLike, observation: _model.Observation):
+        """DSRL z_rl: the LAST prefix slot's post-transformer embedding, [b, emb].
+
+        This is upstream DSRL's official state feature. `dsrl_pi0`'s real-robot loop
+        asks the serve for the whole `[b, s, emb]` prefix tensor and then slices
+        `img_rep_pi0[:, -1, :]` client-side (examples/train_utils_real.py:159-160);
+        this method does the identical slice SERVER-side, so the wire carries 2048
+        floats instead of a full prefix tensor + kv_cache. Mathematically the same
+        feature — do not "improve" it into a mean-pool, that is
+        `extract_image_embedding` and it belongs to the SubRL lineage, not DSRL's.
+
+        The last slot is a right-padded prompt token whose position-cumsum equals the
+        last valid token's, so it attends over the entire prefix: a de-facto readout
+        token, deterministic for a fixed prompt. Language tokens are KEPT
+        (image_only=False) — upstream slices the full prefix.
+        """
+        embs, _ = self.extract_prefix_embeddings(rng, observation, image_only=False)
+        return embs[:, -1, :].astype(jnp.float32)
+
     def extract_image_tokens(self, rng: at.KeyArrayLike, observation: _model.Observation):
         """Unpooled image-token embeddings + mask, for RL-token extraction/training
         (SUBRL_RLTOKEN pipeline). Jit-friendly like extract_image_embedding."""

@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 class WebsocketPolicyServer:
     """Serves a policy using the websocket protocol. See websocket_client_policy.py for a client implementation.
 
-    Currently only implements the `load` and `infer` methods.
+    Implements `infer` (optionally with a caller-supplied flow-matching `noise`,
+    for DSRL latent-space RL) and `get_prefix_rep`.
     """
 
     def __init__(
@@ -55,10 +56,32 @@ class WebsocketPolicyServer:
         while True:
             try:
                 start_time = time.monotonic()
-                obs = msgpack_numpy.unpackb(await websocket.recv())
+                message = msgpack_numpy.unpackb(await websocket.recv())
+
+                # DSRL envelope (upstream dsrl_pi0's wire format), backward-compatible
+                # by construction: a plain observation dict carries no "method"/"obs"
+                # keys, so existing clients (avantbot's FrankaEEPi05Agent, the SubRL
+                # loop, openpi's own examples) fall through to `infer` on the raw dict
+                # exactly as before. Only a client that WANTS noise or the prefix
+                # readout wraps its payload.
+                method = message.get("method", "infer") if isinstance(message, dict) else "infer"
+                obs = message.get("obs", message) if isinstance(message, dict) else message
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                if method == "infer":
+                    # Noise rides INSIDE obs (upstream convention) so it survives any
+                    # client that only knows how to build an observation dict. Pop it
+                    # before the input transforms ever see it.
+                    noise = obs.pop("noise", None) if isinstance(obs, dict) else None
+                    # Keyword-only on our Policy.infer; a positional call is a TypeError.
+                    action = self._policy.infer(obs) if noise is None else self._policy.infer(obs, noise=noise)
+                elif method == "get_prefix_rep":
+                    action = self._policy.get_prefix_rep(obs)
+                elif method == "reset":
+                    self._policy.reset()
+                    action = {}
+                else:
+                    raise ValueError(f"Unknown method {method!r}; expected infer/get_prefix_rep/reset.")
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {
